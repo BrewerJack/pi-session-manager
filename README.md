@@ -33,10 +33,61 @@ Two such extensions fight over the terminal.
 
 ## Quick start
 
-1. Press `alt+s` to open the manager.
+1. Press `alt+s` to open the manager. On macOS, press `⌥S` (Option+S).
 2. Press `n`, type a task, and press `⏎`. The agent starts in the background.
 3. Keep working. A notice appears when the agent finishes or has a question.
-4. Press `alt+s` again to see its status, or press `⏎` to switch to it.
+4. Press the shortcut again to see its status, or press `⏎` to switch to it.
+
+You can also type `/sessions` in any session.
+
+## macOS
+
+The extension works on macOS in Terminal, iTerm2, Ghostty, kitty, WezTerm, Alacritty, and the VS Code terminal.
+The hints and notices show the shortcut as `⌥S`.
+
+Most Mac terminals turn Option+S into the character `ß` instead of sending `alt+s`.
+The extension handles this case.
+When `ß` arrives, it asks macOS whether you hold Option.
+If you do, it opens the manager. If you do not, you just typed `ß`, and it stays in your text.
+
+This check needs pi to run on the Mac itself.
+Over SSH, or when the Mac helper of pi is missing, set your terminal to send Option as Alt instead:
+
+| Terminal | Setting |
+|---|---|
+| Terminal | Settings → Profiles → Keyboard → turn on **Use Option as Meta key**. |
+| iTerm2 | Settings → Profiles → Keys → set **Left Option key** to **Esc+**. |
+| Ghostty | Add `macos-option-as-alt = true` to the config file. |
+| kitty | Add `macos_option_as_alt yes` to `kitty.conf`. |
+| Alacritty | Add `option_as_alt = "Both"` under `[window]`. |
+| WezTerm | Left Option sends Alt by default. |
+
+Other keyboard layouts type other characters for Option+S, for example `‚` on the German layout.
+Add yours to `macOptionChars`, as the next section shows.
+
+On macOS, file names ignore case by default, and `/tmp` points to `/private/tmp`.
+The write locks treat `App.ts` and `app.ts`, and `/tmp/x` and `/private/tmp/x`, as one file.
+
+## Configuration
+
+Add a `sessionManager` key to `~/.pi/agent/settings.json`:
+
+```json
+{
+  "sessionManager": {
+    "shortcut": "alt+s",
+    "macOptionChars": ["ß"]
+  }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `shortcut` | The key that opens the manager. It uses the pi key syntax, for example `alt+m` or `ctrl+alt+s`. The default is `alt+s`. |
+| `macOptionChars` | The characters that open the manager on macOS while you hold Option. The default is the US-layout character of the shortcut letter, for example `ß` for `alt+s`. Set it to `false` to turn the Mac fallback off. |
+
+The environment variable `PI_SESSION_MANAGER_SHORTCUT` overrides `shortcut`.
+Restart pi after you change either one.
 
 ## The manager
 
@@ -118,7 +169,7 @@ When you switch to it, pi redraws its screen.
 - All sessions live in one pi process. `/quit` in any session ends all of them.
   pi keeps the session files, so you can resume them later with `r`.
 - You cannot stop the main session from the manager. Use `/quit`.
-- pi binds `ctrl+r` to renaming, so this extension uses `alt+s`.
+- pi binds `ctrl+r` to renaming, so this extension uses `alt+s` by default.
 
 ## Troubleshooting
 
@@ -130,9 +181,11 @@ The extension then writes suppressed errors to `~/.pi/agent/pi-session-manager-d
 ```bash
 npm install
 npm run typecheck
+npm test
 ```
 
 pi loads the TypeScript files directly. There is no build step.
+The tests need Node.js 24 or newer, which runs TypeScript directly.
 
 ## Acknowledgments
 
@@ -145,12 +198,12 @@ These parts come from pi-parallel-sessions:
 - **Session runtime** (`host.ts`): the code that creates each child session with the model,
   thinking level, tools, and project trust of its parent.
 - **Terminal handoff** (`host.ts`): the code that parks the main session and gives the screen to a child.
-- **Path locks** (`host.ts`): the code that stops two sessions from writing the same path at once.
+- **Path locks** (`locks.ts`): the code that stops two sessions from writing the same path at once.
 - **Pickers** (`pickers.ts`): the folder explorer and the saved-session picker.
 
 This project adds the manager overlay, the detail screen, the status bar, and background agents.
 It also adds the hidden terminal for background sessions, usage and context stats, notices,
-and the `/sessions` subcommands.
+and the `/sessions` subcommands, macOS keyboard support, and case-aware and symlink-aware path locks.
 
 ## License
 

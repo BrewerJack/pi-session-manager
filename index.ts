@@ -1,6 +1,13 @@
 // pi-session-manager: run several agents in one pi process and manage them from a
-// Claude-Code-style overlay. Open it with /sessions or alt+s.
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+// Claude-Code-style overlay. Open it with /sessions or the shortcut (alt+s, or ⌥S on macOS).
+import path from "node:path";
+import {
+	getAgentDir,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import { getNativeClipboard, type KeyId } from "@earendil-works/pi-tui";
 import {
 	debug,
 	getHost,
@@ -13,10 +20,13 @@ import {
 	type Outcome,
 	type SessionHost,
 } from "./host.ts";
+import { displayKey, isMacOptionShortcut, loadKeyConfig, type KeyConfig, type ModifierProbe } from "./keys.ts";
 import { fmtAgo, fmtCost, fmtDuration, fmtTokens, ManagerView, shortPath, StatusBar, type ManagerResult } from "./ui.ts";
 
-// pi binds ctrl+r to app.session.rename, so use a key that no built-in action claims.
-const SHORTCUT = "alt+s";
+// pi binds ctrl+r to app.session.rename, so the default is alt+s. Settings can change it.
+let KEYS: KeyConfig = loadKeyConfig(path.join(getAgentDir(), "settings.json"), process.env);
+/** The shortcut as the platform writes it, for hints and notices. */
+let SHORTCUT = displayKey(KEYS.shortcut, process.platform);
 const WIDGET_KEY = "pi-session-manager";
 const SUBCOMMANDS: [string, string][] = [
 	["new", "Start an agent. With a task, it runs in the background."],
@@ -32,6 +42,9 @@ type Ctx = ExtensionContext | ExtensionCommandContext;
 export default function sessionManager(pi: ExtensionAPI) {
 	const host = getHost();
 	patchWorkingIndicator(host);
+	KEYS = loadKeyConfig(path.join(getAgentDir(), "settings.json"), process.env);
+	SHORTCUT = displayKey(KEYS.shortcut, process.platform);
+	let stopMacKeys: (() => void) | undefined;
 
 	const bind = (ctx: Ctx): LiveSession => host.bind(ctx, pi);
 
@@ -41,14 +54,23 @@ export default function sessionManager(pi: ExtensionAPI) {
 		handler: async (args: string, ctx: ExtensionCommandContext) => runCommand(pi, host, args.trim(), ctx),
 	});
 
-	pi.registerShortcut(SHORTCUT, {
+	// SAFETY: loadKeyConfig only returns shortcuts that match the KeyId grammar of pi-tui.
+	pi.registerShortcut(KEYS.shortcut as KeyId, {
 		description: "Open the session manager",
 		handler: async (ctx: ExtensionContext) => openManager(pi, host, ctx),
 	});
 
 	pi.on("session_start", (_event, ctx) => {
 		bind(ctx);
-		if (ctx.mode === "tui") installStatusBar(ctx, host);
+		if (ctx.mode === "tui") {
+			installStatusBar(ctx, host);
+			stopMacKeys?.();
+			stopMacKeys = installMacOptionKey(pi, host, ctx);
+			if (!host.warnedKeys) {
+				host.warnedKeys = true;
+				for (const warning of KEYS.warnings) ctx.ui.notify(warning, "warning");
+			}
+		}
 		host.notify();
 	});
 
@@ -182,6 +204,8 @@ export default function sessionManager(pi: ExtensionAPI) {
 	pi.on("session_shutdown", (_event, ctx) => {
 		const r = bind(ctx);
 		host.locks.release(r.id);
+		stopMacKeys?.();
+		stopMacKeys = undefined;
 		try {
 			ctx.ui.setWidget(WIDGET_KEY, undefined);
 		} catch (error) {
@@ -209,6 +233,42 @@ function finishRun(host: SessionHost, r: LiveSession, outcome: Outcome): void {
 		else host.notifyActive(`■ "${titleOf(r)}" was interrupted`, "warning");
 	}
 	host.notify();
+}
+
+/** pi's macOS native helper, or undefined when pi runs elsewhere or without it (for example over SSH). */
+function macModifierProbe(): ModifierProbe | undefined {
+	if (process.platform !== "darwin") return undefined;
+	try {
+		const helper: any = getNativeClipboard();
+		if (typeof helper?.isModifierPressed !== "function") return undefined;
+		return (name) => {
+			try {
+				return helper.isModifierPressed(name) === true;
+			} catch (error) {
+				debug(error);
+				return false;
+			}
+		};
+	} catch (error) {
+		debug(error);
+		return undefined;
+	}
+}
+
+/**
+ * Open the manager when a macOS terminal turns Option+S into "ß". Terminals that
+ * send alt+s, such as ones with "Option as Meta" turned on, use the normal shortcut.
+ */
+function installMacOptionKey(pi: ExtensionAPI, host: SessionHost, ctx: ExtensionContext): (() => void) | undefined {
+	if (!KEYS.macOptionChars.length) return undefined;
+	const pressed = macModifierProbe();
+	if (!pressed) return undefined;
+	return ctx.ui.onTerminalInput((data) => {
+		if (host.managerOpen || !isMacOptionShortcut(data, KEYS.macOptionChars, pressed)) return undefined;
+		if (host.bind(ctx, pi).id !== host.activeId) return undefined;
+		void openManager(pi, host, ctx).catch((error) => debug(error));
+		return { consume: true };
+	});
 }
 
 function installStatusBar(ctx: ExtensionContext, host: SessionHost): void {
@@ -240,8 +300,10 @@ async function openManager(
 		ctx.ui.notify(statusReport(host), "info");
 		return;
 	}
+	if (host.managerOpen) return;
 	const r = host.bind(ctx, pi);
 	r.ownPromptPending++;
+	host.managerOpen = true;
 	let result: ManagerResult;
 	try {
 		result = await ctx.ui.custom<ManagerResult>(
@@ -250,6 +312,7 @@ async function openManager(
 			{ overlay: true, overlayOptions: { width: "94%", minWidth: 60, maxHeight: "92%", anchor: "center" } },
 		);
 	} finally {
+		host.managerOpen = false;
 		// If pi did not report the overlay as a prompt, drop the unused marker.
 		if (r.ownPromptPending > 0) r.ownPromptPending--;
 	}

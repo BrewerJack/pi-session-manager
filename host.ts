@@ -1,7 +1,5 @@
 // Live-session host: keeps several pi sessions alive in one process and hands the
 // terminal to one of them at a time.
-import { appendFileSync } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -17,6 +15,11 @@ import {
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { ProcessTerminal } from "@earendil-works/pi-tui";
+import { LockManager } from "./locks.ts";
+import { debug } from "./log.ts";
+
+export { inferToolPaths } from "./locks.ts";
+export { debug } from "./log.ts";
 
 export const PARENT_ID = "__parent__";
 const HOST_KEY = "__PI_SESSION_MANAGER_HOST__";
@@ -143,17 +146,6 @@ function sanitizeName(name: string): string {
 			.replace(/^-+|-+$/g, "")
 			.slice(0, 40) || "session"
 	);
-}
-
-/** Best-effort calls land here. Set PI_SESSION_MANAGER_DEBUG=1 to log them. */
-export function debug(error: unknown): void {
-	if (!process.env.PI_SESSION_MANAGER_DEBUG) return;
-	try {
-		const line = `${new Date().toISOString()} ${error instanceof Error ? error.stack : String(error)}\n`;
-		appendFileSync(path.join(getAgentDir(), "pi-session-manager-debug.log"), line);
-	} catch {
-		// The debug log is optional. Nothing else can report this failure.
-	}
 }
 
 function resetExtendedKeyboardModesForHandoff(): void {
@@ -283,92 +275,6 @@ const createRuntime = async ({ cwd, agentDir, sessionManager, sessionStartEvent 
 	const result = await createAgentSessionFromServices({ services, sessionManager, sessionStartEvent, ...sessionOptions });
 	return { ...result, services, diagnostics: services.diagnostics };
 };
-
-// ---------------------------------------------------------------------------
-// Path locks: two live sessions must not write the same path tree at once.
-
-function asString(value: unknown): string | null {
-	return typeof value === "string" && value.trim() ? value : null;
-}
-
-export function inferToolPaths(toolName: string, input: any): string[] {
-	const paths = new Set<string>();
-	if (toolName === "write" || toolName === "edit") {
-		const p = asString(input?.path) || asString(input?.file_path) || asString(input?.filePath);
-		if (p) paths.add(p);
-	}
-	if (toolName === "bash") {
-		const command = asString(input?.command) || "";
-		for (const m of command.matchAll(/(?:>|>>|2>|&>)\s*([^\s;&|]+)/g)) {
-			const p = m[1];
-			if (p && !p.startsWith("/dev/")) paths.add(p.replace(/^["']|["']$/g, ""));
-		}
-		const mutating =
-			/\b(rm|mv|cp|touch|mkdir|rmdir|chmod|chown|install|tee|sed\s+-i|perl\s+-i|python\b.*\b(open|write)|node\b.*writeFile)\b/.test(
-				command,
-			);
-		if (mutating) {
-			for (const token of command.match(/(?:\.\.?|~|\/)?[\w@%+=:,./-]+/g) || []) {
-				if (token.includes("/") || token.startsWith(".")) paths.add(token.replace(/^["']|["']$/g, ""));
-			}
-			if (paths.size === 0) paths.add(".");
-		}
-	}
-	return [...paths];
-}
-
-function normalizeLockPath(p: string, cwd: string): string | null {
-	if (!p || typeof p !== "string") return null;
-	if (p.startsWith("~")) return path.join(os.homedir(), p.slice(1));
-	return path.resolve(cwd || process.cwd(), p);
-}
-
-function pathsConflict(a: string, b: string): boolean {
-	const ar = a.endsWith(path.sep) ? a : a + path.sep;
-	const br = b.endsWith(path.sep) ? b : b + path.sep;
-	return a === b || a.startsWith(br) || b.startsWith(ar);
-}
-
-export class LockManager {
-	locks = new Map<string, { sessionId: string; acquiredAt: number }>();
-	heldByToolCall = new Map<string, { sessionId: string; paths: string[] }>();
-
-	acquire(sessionId: string, rawPaths: string[], cwd: string) {
-		const paths = [
-			...new Set(rawPaths.map((p) => normalizeLockPath(p, cwd)).filter((p): p is string => !!p)),
-		].sort();
-		const conflicts: { path: string; heldPath: string; by: string }[] = [];
-		for (const p of paths) {
-			for (const [held, info] of this.locks.entries()) {
-				if (info.sessionId !== sessionId && pathsConflict(p, held)) {
-					conflicts.push({ path: p, heldPath: held, by: info.sessionId });
-				}
-			}
-		}
-		if (conflicts.length) return { ok: false as const, conflicts };
-		const acquiredAt = Date.now();
-		for (const p of paths) this.locks.set(p, { sessionId, acquiredAt });
-		return { ok: true as const, paths };
-	}
-
-	release(sessionId: string, rawPaths?: string[]): void {
-		const wanted = rawPaths?.length ? new Set(rawPaths) : null;
-		for (const [p, info] of this.locks.entries()) {
-			if (info.sessionId === sessionId && (!wanted || wanted.has(p))) this.locks.delete(p);
-		}
-	}
-
-	releaseByToolCall(toolCallId: string): void {
-		const held = this.heldByToolCall.get(toolCallId);
-		if (!held) return;
-		this.heldByToolCall.delete(toolCallId);
-		this.release(held.sessionId, held.paths);
-	}
-
-	heldBy(sessionId: string): string[] {
-		return [...this.locks.entries()].filter(([, info]) => info.sessionId === sessionId).map(([p]) => p);
-	}
-}
 
 // ---------------------------------------------------------------------------
 // GatedTerminal is the terminal that a child InteractiveMode draws to. While its
@@ -591,6 +497,10 @@ export class SessionHost {
 	activationInProgress: Promise<void> | null = null;
 	queuedActivation: string | null = null;
 	workingIndicator: { frames?: string[]; intervalMs?: number } | undefined;
+	/** The manager overlay is open in some session. */
+	managerOpen = false;
+	/** Shortcut warnings reached the user once. */
+	warnedKeys = false;
 	private notifyScheduled = false;
 
 	constructor() {
