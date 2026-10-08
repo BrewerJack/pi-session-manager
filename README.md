@@ -106,6 +106,7 @@ Each row shows one live session:
 | `■` | You interrupted the agent. |
 | `✗` | The run failed. |
 | `○` | The session is ready. |
+| `◇` | A saved session from an earlier run. It starts when you use it. |
 | `•` | The agent finished while you were in another session. |
 
 A preview under the list shows the last prompt and the newest reply of the selected session.
@@ -121,7 +122,7 @@ A preview under the list shows the last prompt and the newest reply of the selec
 | `m` | Send a message. If the agent is busy, pi queues the message. |
 | `e` | Rename the session. pi saves the name in the session file. |
 | `x` | Interrupt the current run. |
-| `k` | Stop a session. The manager asks first. |
+| `k` | Stop a session. The manager asks first. On a saved session, `k` removes it from the list, and its file stays. |
 | `o` | Start a session in another folder. |
 | `r` | Open a saved session as a live session. |
 | `/` | Filter by name, folder, prompt, or model. |
@@ -148,6 +149,26 @@ Use `↑` `↓` `pgup` `pgdn` to scroll, and `tab` to go to the next session.
 
 Press `tab` after `/sessions` to complete subcommands and session names.
 
+## Reopen a main session
+
+The main session records which child sessions belong to it.
+When you open that main session again, its child sessions come back as saved sessions (`◇`):
+
+```bash
+pi --session <id>   # also with --continue, --resume, or /resume
+```
+
+A notice shows how many sessions came back.
+A saved session costs almost nothing, because it has no running pi session yet.
+The manager shows its transcript, model, and usage from its file.
+
+A saved session starts when you switch to it or send it a message with `m`.
+It keeps its own model and history.
+Rename works on saved sessions too.
+
+The record lives in the main session file as a custom entry. The model never sees it.
+Sessions that never got a message have no file, so they do not come back.
+
 ## Status bar
 
 When more than one session is live, a line under the editor shows every session and its state.
@@ -167,7 +188,7 @@ When you switch to it, pi redraws its screen.
 ## Limits
 
 - All sessions live in one pi process. `/quit` in any session ends all of them.
-  pi keeps the session files, so you can resume them later with `r`.
+  pi keeps the session files. Reopen the main session to bring the child sessions back.
 - You cannot stop the main session from the manager. Use `/quit`.
 - pi binds `ctrl+r` to renaming, so this extension uses `alt+s` by default.
 

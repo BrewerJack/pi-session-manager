@@ -60,8 +60,16 @@ export default function sessionManager(pi: ExtensionAPI) {
 		handler: async (ctx: ExtensionContext) => openManager(pi, host, ctx),
 	});
 
-	pi.on("session_start", (_event, ctx) => {
-		bind(ctx);
+	pi.on("session_start", (event, ctx) => {
+		const r = bind(ctx);
+		// A main session that opens from a file brings back its child sessions as saved rows.
+		if (r.kind === "parent" && event.reason !== "reload") {
+			const restored = host.loadMembership(ctx, event.reason);
+			if (restored && ctx.hasUI) {
+				const what = restored === 1 ? "1 saved session" : `${restored} saved sessions`;
+				ctx.ui.notify(`Restored ${what}. Press ${SHORTCUT} to open one.`, "info");
+			}
+		}
 		if (ctx.mode === "tui") {
 			installStatusBar(ctx, host);
 			stopMacKeys?.();
@@ -205,6 +213,8 @@ export default function sessionManager(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", (_event, ctx) => {
 		const r = bind(ctx);
+		// The delayed save may not run before pi exits.
+		if (r.kind === "parent") host.persistMembership();
 		host.locks.release(r.id);
 		stopMacKeys?.();
 		stopMacKeys = undefined;
@@ -345,6 +355,7 @@ function statusReport(host: SessionHost): string {
 
 function describeState(r: LiveSession, activity: string): string {
 	if (r.state === "error") return `error: ${r.error}`;
+	if (r.state === "saved") return "saved";
 	if (activity === "waiting") return "needs input";
 	if (activity !== "working") return r.lastOutcome ?? "ready";
 	const elapsed = r.runStartedAt ? fmtDuration(Date.now() - r.runStartedAt) : "";

@@ -1,5 +1,6 @@
 // Live-session host: keeps several pi sessions alive in one process and hands the
 // terminal to one of them at a time.
+import { existsSync, statSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -26,12 +27,16 @@ export const PARENT_ID = "__parent__";
 const HOST_KEY = "__PI_SESSION_MANAGER_HOST__";
 const SPINNER_PATCHED: unique symbol = Symbol.for("pi-session-manager.spinnerPatched");
 const STATS_TTL_MS = 1000;
+/** Custom entry in the main session that lists the session files of its child sessions. */
+const CHILDREN_ENTRY = "pi-session-manager.children";
+const PERSIST_DELAY_MS = 1000;
 
 type Ctx = any;
 type Api = any;
 
 export type Activity = "idle" | "working" | "waiting";
-type LiveState = "active" | "background" | "starting" | "stopped" | "error";
+/** "saved" rows come from a reopened main session. They have no runtime until they start. */
+type LiveState = "active" | "background" | "starting" | "saved" | "stopped" | "error";
 export type Outcome = "done" | "aborted" | "error";
 
 interface ToolActivity {
@@ -93,6 +98,10 @@ export interface LiveSession {
 	runPromise?: Promise<void>;
 	expectedStop?: boolean;
 	statsCache?: { at: number; value: SessionStatsView };
+	/** Session manager of a saved row, read from its file. */
+	savedManager?: any;
+	/** A start of this saved row is in progress. */
+	waking?: Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +227,35 @@ function createInheritedSettingsManager(cwd: string, agentDir: string, inheritan
 	return { settingsManager: SettingsManager.create(cwd, agentDir, { projectTrusted }), diagnostics };
 }
 
+/** A model by provider and id, if the runtime has it and holds a login for its provider. */
+function usableModel(modelRuntime: any, provider: string, modelId: string): any {
+	const model = modelRuntime?.getModel?.(provider, modelId);
+	return model && modelRuntime.hasConfiguredAuth?.(model.provider) ? model : undefined;
+}
+
+/**
+ * The model that a session with history last used. pi restores it from the file, but
+ * some extension providers register their models in the first runtime of a process only.
+ * Fall back to the model object of the session that starts the child.
+ */
+function savedSessionModel(services: any, sessionManager: any, inheritance: any): any {
+	let saved: { provider: string; modelId: string } | undefined;
+	try {
+		saved = sessionManager.buildSessionContext?.().model ?? undefined;
+	} catch (error) {
+		debug(error);
+	}
+	if (!saved) return undefined;
+	const own = usableModel(services.modelRuntime, saved.provider, saved.modelId);
+	if (own) return own;
+	const registries = [inheritance?.ctx?.modelRegistry, getHost().parent.context?.modelRegistry];
+	for (const registry of registries) {
+		const model = registry?.find?.(saved.provider, saved.modelId);
+		if (model) return model;
+	}
+	return undefined;
+}
+
 async function resolveChildSessionOptions(
 	services: any,
 	sessionManager: any,
@@ -225,30 +263,31 @@ async function resolveChildSessionOptions(
 ): Promise<ChildSessionOptions> {
 	const inherited: ChildSessionOptions = { ...(inheritance?.sessionOptions ?? {}) };
 	const existing = hasExistingMessages(sessionManager);
-	// A session with history keeps its own model and thinking level.
 	let options: ChildSessionOptions = { ...inherited };
 	if (existing) {
+		// A session with history keeps its own model, and pi restores its thinking level.
 		options = {};
 		if (inherited.tools) options.tools = inherited.tools;
-	}
-	// Each child owns its model runtime. Look the inherited model up there.
-	if (options.model) {
-		options.model = services.modelRegistry?.find?.(options.model.provider, options.model.id) ?? options.model;
+		const model = savedSessionModel(services, sessionManager, inheritance);
+		if (model) options.model = model;
+	} else if (inherited.model) {
+		// Each child owns its model runtime. Use its copy of the inherited model when it has one.
+		options.model = usableModel(services.modelRuntime, inherited.model.provider, inherited.model.id) ?? inherited.model;
 	}
 	const patterns = services.settingsManager?.getEnabledModels?.();
 	if (!patterns?.length) return options;
 	const { resolveModelScope } = await loadModelResolver();
-	const scopedModels = await resolveModelScope(patterns, services.modelRegistry);
+	const scopedModels = await resolveModelScope(patterns, services.modelRuntime);
 	if (!scopedModels.length) return options;
 	options.scopedModels = scopedModels;
 	if (!existing) {
-		const inherited = inheritance?.sessionOptions?.model;
 		const savedProvider = services.settingsManager?.getDefaultProvider?.();
 		const savedModelId = services.settingsManager?.getDefaultModel?.();
-		const saved = savedProvider && savedModelId ? services.modelRegistry.find(savedProvider, savedModelId) : undefined;
+		const defaultModel =
+			savedProvider && savedModelId ? services.modelRuntime?.getModel?.(savedProvider, savedModelId) : undefined;
 		const selected =
-			scopedModels.find((s: any) => sameModel(s.model, inherited)) ??
-			scopedModels.find((s: any) => sameModel(s.model, saved)) ??
+			scopedModels.find((scoped: any) => sameModel(scoped.model, inherited.model)) ??
+			scopedModels.find((scoped: any) => sameModel(scoped.model, defaultModel)) ??
 			scopedModels[0];
 		options.model = selected.model;
 		if (selected.thinkingLevel) options.thinkingLevel = selected.thinkingLevel;
@@ -513,6 +552,11 @@ export class SessionHost {
 	managerOpen = false;
 	/** Shortcut warnings reached the user once. */
 	warnedKeys = false;
+	/** Session id of the main session whose child list the host loaded. */
+	private membershipFor?: string;
+	/** The child list that the main session last recorded. */
+	private persistedKey?: string;
+	private persistTimer?: ReturnType<typeof setTimeout>;
 	private notifyScheduled = false;
 	/** The main session. It lives as long as the process. */
 	readonly parent: LiveSession;
@@ -559,6 +603,7 @@ export class SessionHost {
 	}
 
 	notify(): void {
+		this.schedulePersist();
 		for (const listener of [...this.subscribers]) {
 			try {
 				listener();
@@ -594,7 +639,7 @@ export class SessionHost {
 
 	sessionManagerOf(record: LiveSession): any {
 		try {
-			return record.runtime?.session?.sessionManager ?? record.context?.sessionManager;
+			return record.runtime?.session?.sessionManager ?? record.context?.sessionManager ?? record.savedManager;
 		} catch {
 			return undefined;
 		}
@@ -656,15 +701,22 @@ export class SessionHost {
 
 	async createChild(opts: CreateChildOptions): Promise<LiveSession> {
 		if (opts.ctx) this.bind(opts.ctx);
+		const record = this.newChildRecord(opts.cwd, opts.name);
+		record.firstPrompt = opts.task ? oneLine(opts.task) : undefined;
+		this.records.set(record.id, record);
+		this.notify();
 		const sessionManager = opts.sessionManager ?? SessionManager.create(opts.cwd, undefined, {});
-		const inheritance = collectInheritance(opts.ctx);
+		await this.startChild(record, sessionManager, opts);
+		return record;
+	}
+
+	private newChildRecord(cwd: string, name?: string): LiveSession {
 		const now = Date.now();
-		const slug = sanitizeName(opts.name || path.basename(opts.cwd));
-		const id = `${slug}-${now.toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-		const record: LiveSession = {
-			id,
+		const slug = sanitizeName(name || path.basename(cwd));
+		return {
+			id: `${slug}-${now.toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
 			kind: "child",
-			cwd: opts.cwd,
+			cwd,
 			state: "starting",
 			createdAt: now,
 			lastActivityAt: now,
@@ -673,15 +725,23 @@ export class SessionHost {
 			promptDepth: 0,
 			ownPromptPending: 0,
 			ignoredPromptEnds: 0,
-			inheritance,
-			firstPrompt: opts.task ? oneLine(opts.task) : undefined,
 		};
-		this.records.set(id, record);
+	}
+
+	/** Give a record a runtime and a hidden InteractiveMode, and start it. */
+	private async startChild(
+		record: LiveSession,
+		sessionManager: any,
+		opts: { ctx?: Ctx; task?: string; name?: string },
+	): Promise<void> {
+		const inheritance = collectInheritance(opts.ctx);
+		record.inheritance = inheritance;
+		record.state = "starting";
 		this.notify();
 		inheritanceBySessionManager.set(sessionManager, inheritance);
 		try {
 			const runtime = await createAgentSessionRuntime(createRuntime, {
-				cwd: opts.cwd,
+				cwd: record.cwd,
 				agentDir: getAgentDir(),
 				sessionManager,
 				sessionStartEvent: { type: "session_start", reason: "startup" },
@@ -699,6 +759,7 @@ export class SessionHost {
 			record.mode = mode;
 			record.terminal = terminal;
 			record.view = new ChildView(record, this);
+			record.savedManager = undefined;
 			record.state = "background";
 			if (opts.name) runtime.session.setSessionName(opts.name);
 			this.refreshMeta(record);
@@ -710,12 +771,116 @@ export class SessionHost {
 			throw error;
 		}
 		this.notify();
+	}
+
+	/**
+	 * Start a saved row. Calls during a start wait for that start. A task becomes the
+	 * initial message, which pi sends once startup finishes and all extensions are ready.
+	 */
+	async wake(record: LiveSession, ctx?: Ctx, task?: string): Promise<void> {
+		if (record.waking) return record.waking;
+		if (record.state !== "saved") return;
+		const file = record.sessionFile;
+		if (!file || !existsSync(file)) throw new Error(`The session file of "${titleOf(record)}" is gone.`);
+		const sessionManager = SessionManager.open(file, undefined, undefined);
+		record.waking = this.startChild(record, sessionManager, { ctx: ctx ?? this.parent.context, task }).finally(() => {
+			record.waking = undefined;
+		});
+		return record.waking;
+	}
+
+	/** Add a saved row for a session file, unless the file is missing or already listed. */
+	addSaved(file: string): LiveSession | undefined {
+		if (!existsSync(file) || file === this.parent.sessionFile) return undefined;
+		if ([...this.records.values()].some((r) => r.sessionFile === file)) return undefined;
+		let sessionManager: any;
+		try {
+			sessionManager = SessionManager.open(file, undefined, undefined);
+		} catch (error) {
+			debug(error);
+			return undefined;
+		}
+		const record = this.newChildRecord(sessionManager.getCwd?.() || process.cwd());
+		record.state = "saved";
+		record.savedManager = sessionManager;
+		record.sessionFile = file;
+		try {
+			record.lastActivityAt = statSync(file).mtimeMs;
+		} catch (error) {
+			debug(error);
+		}
+		this.records.set(record.id, record);
+		this.refreshMeta(record);
 		return record;
+	}
+
+	// --- Child list of the main session ----------------------------------
+
+	/**
+	 * Load the child list of the main session that just started, and add a saved row
+	 * for each child. Saved rows of the previous main session leave the list.
+	 * Live children stay, and the next save records them in the new main session.
+	 */
+	loadMembership(ctx: Ctx, reason: string): number {
+		for (const r of [...this.records.values()]) {
+			if (r.state === "saved") this.records.delete(r.id);
+		}
+		let files: string[] = [];
+		if (reason !== "new") {
+			try {
+				for (const entry of ctx.sessionManager?.getBranch?.() ?? []) {
+					if (entry?.type !== "custom" || entry.customType !== CHILDREN_ENTRY) continue;
+					const listed = entry.data?.files;
+					if (Array.isArray(listed)) files = listed.filter((f: unknown): f is string => typeof f === "string");
+				}
+			} catch (error) {
+				debug(error);
+			}
+		}
+		let restored = 0;
+		for (const file of files) {
+			if (this.addSaved(file)) restored++;
+		}
+		this.membershipFor = this.parent.sessionId;
+		this.persistedKey = JSON.stringify(files);
+		this.notify();
+		return restored;
+	}
+
+	private childFiles(): string[] {
+		return this.list().flatMap((r) => (r.kind === "child" && r.sessionFile && r.state !== "error" ? [r.sessionFile] : []));
+	}
+
+	private schedulePersist(): void {
+		if (this.persistTimer) return;
+		this.persistTimer = setTimeout(() => {
+			this.persistTimer = undefined;
+			this.persistMembership();
+		}, PERSIST_DELAY_MS);
+		this.persistTimer.unref?.();
+	}
+
+	/** Record the child list in the main session when it changed. */
+	persistMembership(): void {
+		const pi = this.parent.pi;
+		if (!pi || !this.membershipFor || this.membershipFor !== this.parent.sessionId) return;
+		const files = this.childFiles();
+		const key = JSON.stringify(files);
+		if (key === this.persistedKey) return;
+		try {
+			pi.appendEntry(CHILDREN_ENTRY, { files });
+			this.persistedKey = key;
+		} catch (error) {
+			debug(error);
+		}
 	}
 
 	async openSaved(sessionPath: string, ctx?: Ctx): Promise<LiveSession> {
 		const existing = this.list().find((r) => r.sessionFile === sessionPath);
-		if (existing) return existing;
+		if (existing) {
+			await this.wake(existing, ctx);
+			return existing;
+		}
 		const sessionManager = SessionManager.open(sessionPath, undefined, undefined);
 		const cwd = sessionManager.getCwd?.() || process.cwd();
 		return this.createChild({ cwd, ctx, sessionManager });
@@ -724,6 +889,12 @@ export class SessionHost {
 	async stopChild(idOrName: string): Promise<void> {
 		const record = this.get(idOrName);
 		if (!record || record.kind !== "child") throw new Error("session not found");
+		if (record.state === "saved" && !record.waking) {
+			// A saved row has no runtime. Removing it leaves the file in place.
+			this.records.delete(record.id);
+			this.notify();
+			return;
+		}
 		const wasActive = this.activeId === record.id;
 		record.expectedStop = true;
 		record.state = "stopped";
@@ -743,6 +914,7 @@ export class SessionHost {
 	async activate(target: string): Promise<void> {
 		const record = this.get(target);
 		if (!record) throw new Error(`session not found: ${target}`);
+		await this.wake(record);
 		if (this.activationInProgress) {
 			this.queuedActivation = record.id;
 			await this.activationInProgress;
@@ -834,15 +1006,24 @@ export class SessionHost {
 		if (!trimmed) return;
 		const session = record.runtime?.session;
 		if (session) session.setSessionName(trimmed);
+		else if (record.savedManager) record.savedManager.appendSessionInfo(trimmed);
 		else if (record.pi) record.pi.setSessionName(trimmed);
 		else throw new Error("This session cannot be renamed yet.");
 		record.sessionName = trimmed;
 		this.notify();
 	}
 
-	send(record: LiveSession, text: string): void {
+	async send(record: LiveSession, text: string): Promise<void> {
 		const message = text.trim();
 		if (!message) return;
+		if (record.waking) {
+			await record.waking;
+		} else if (record.state === "saved") {
+			// Extensions finish their setup during startup, so the message waits for it.
+			record.firstPrompt ??= oneLine(message);
+			await this.wake(record, undefined, message);
+			return;
+		}
 		const session = record.runtime?.session;
 		const busy = session ? session.isStreaming : record.running;
 		const options = busy ? { deliverAs: "followUp" as const } : undefined;
@@ -907,7 +1088,7 @@ export class SessionHost {
 					contextPercent: s.contextUsage?.percent ?? null,
 				};
 			}
-			for (const entry of record.context?.sessionManager?.getEntries?.() ?? []) {
+			for (const entry of this.sessionManagerOf(record)?.getEntries?.() ?? []) {
 				if (entry?.type !== "message") continue;
 				const msg = entry.message;
 				if (msg?.role === "user") out.userMessages++;
@@ -939,10 +1120,16 @@ export class SessionHost {
 	modelLabel(record: LiveSession): string {
 		try {
 			const session = record.runtime?.session;
-			const model = session?.model ?? record.context?.model;
-			const thinking = session?.thinkingLevel ?? record.context?.thinkingLevel;
-			if (!model) return "";
-			return thinking && thinking !== "off" ? `${model.id} · ${thinking}` : model.id;
+			let modelId: string | undefined = (session?.model ?? record.context?.model)?.id;
+			let thinking: string | undefined = session?.thinkingLevel ?? record.context?.thinkingLevel;
+			if (!modelId && record.savedManager) {
+				// A saved row reads the model and thinking level from its file.
+				const saved = record.savedManager.buildSessionContext?.();
+				modelId = saved?.model?.modelId;
+				thinking = saved?.thinkingLevel;
+			}
+			if (!modelId) return "";
+			return thinking && thinking !== "off" ? `${modelId} · ${thinking}` : modelId;
 		} catch {
 			return "";
 		}

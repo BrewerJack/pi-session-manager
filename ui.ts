@@ -118,6 +118,7 @@ function spinnerFrame(host: SessionHost, theme: Theme, frame: number): string {
 function statusIcon(host: SessionHost, r: LiveSession, theme: Theme, frame: number): string {
 	if (r.state === "error") return theme.fg("error", "✗");
 	if (r.state === "starting") return theme.fg("dim", "◌");
+	if (r.state === "saved") return theme.fg("dim", "◇");
 	const activity = host.activity(r);
 	if (activity === "waiting") return theme.bold(theme.fg("warning", "?"));
 	if (activity === "working") return spinnerFrame(host, theme, frame) || theme.fg("accent", "●");
@@ -130,6 +131,7 @@ function statusIcon(host: SessionHost, r: LiveSession, theme: Theme, frame: numb
 function statusText(host: SessionHost, r: LiveSession, theme: Theme): string {
 	if (r.state === "error") return theme.fg("error", `error: ${r.error ?? "failed"}`);
 	if (r.state === "starting") return theme.fg("dim", "starting…");
+	if (r.state === "saved") return theme.fg("dim", "saved · ⏎ starts it");
 	const activity = host.activity(r);
 	if (activity === "waiting") {
 		return theme.fg("warning", r.promptTitle ? `needs input · ${r.promptTitle}` : "needs input");
@@ -404,11 +406,15 @@ export class ManagerView implements Component, Focusable {
 				this.say(`Renamed to "${value}"`);
 			});
 		} else if (prompt.kind === "message") {
-			void this.run("Send", () => {
+			void this.run("Send", async () => {
 				if (!value) return;
 				const queued = this.host.activity(target) !== "idle";
-				this.host.send(target, value);
-				this.say(queued ? `Queued for "${titleOf(target)}"` : `Sent to "${titleOf(target)}"`);
+				const started = target.state === "saved";
+				await this.host.send(target, value);
+				let note = `Sent to "${titleOf(target)}"`;
+				if (queued) note = `Queued for "${titleOf(target)}"`;
+				else if (started) note = `Started "${titleOf(target)}" and sent the message`;
+				this.say(note);
 			});
 		}
 	}
@@ -446,9 +452,10 @@ export class ManagerView implements Component, Focusable {
 		}
 		void this.run("Stop", async () => {
 			const title = titleOf(r);
+			const saved = r.state === "saved";
 			await this.host.stopChild(r.id);
 			if (this.screen === "detail") this.screen = "list";
-			this.say(`Stopped "${title}"`);
+			this.say(saved ? `Removed "${title}" from the list. Its file stays.` : `Stopped "${title}"`);
 		});
 	}
 
@@ -659,9 +666,11 @@ export class ManagerView implements Component, Focusable {
 	private headerCounts(): string {
 		const th = this.theme;
 		const all = this.host.list();
+		const saved = all.filter((r) => r.state === "saved").length;
 		const working = all.filter((r) => this.host.activity(r) === "working").length;
 		const waiting = all.filter((r) => this.host.activity(r) === "waiting").length;
-		const parts = [th.fg("muted", `${all.length} live`)];
+		const parts = [th.fg("muted", `${all.length - saved} live`)];
+		if (saved) parts.push(th.fg("dim", `${saved} saved`));
 		if (working) parts.push(th.fg("accent", `${working} working`));
 		if (waiting) parts.push(th.fg("warning", `${waiting} need input`));
 		return parts.join(th.fg("dim", " · "));
@@ -687,9 +696,12 @@ export class ManagerView implements Component, Focusable {
 			const target = this.host.get(this.confirmKillId);
 			out.push(box.sep());
 			const running = target && this.host.activity(target) !== "idle" ? " It is still running." : "";
+			const name = target ? titleOf(target) : "session";
+			const question =
+				target?.state === "saved" ? `Remove "${name}" from the list? Its file stays.` : `Stop "${name}"?${running}`;
 			out.push(
 				box.line(
-					th.fg("warning", `Stop "${target ? titleOf(target) : "session"}"?${running} `) +
+					th.fg("warning", `${question} `) +
 						th.fg("dim", "y/enter confirm · any other key cancels"),
 				),
 			);
@@ -953,7 +965,8 @@ export class StatusBar implements Component {
 	) {}
 
 	render(width: number): string[] {
-		const sessions = this.host.list();
+		// Saved rows stay out of the status bar until they start.
+		const sessions = this.host.list().filter((r) => r.state !== "saved");
 		if (sessions.length < 2) {
 			this.setTimer(false);
 			return [];
