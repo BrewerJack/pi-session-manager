@@ -134,6 +134,24 @@ npm run typecheck
 
 pi loads the TypeScript files directly. There is no build step.
 
+## Acknowledgments
+
+This extension builds on [pi-parallel-sessions](https://github.com/liushihao456/pi-sessions)
+by [liushihao456](https://github.com/liushihao456), under the MIT license.
+That project showed how to run several pi sessions in one process and pass the terminal between them.
+
+These parts come from pi-parallel-sessions:
+
+- **Session runtime** (`host.ts`): the code that creates each child session with the model,
+  thinking level, tools, and project trust of its parent.
+- **Terminal handoff** (`host.ts`): the code that parks the main session and gives the screen to a child.
+- **Path locks** (`host.ts`): the code that stops two sessions from writing the same path at once.
+- **Pickers** (`pickers.ts`): the folder explorer and the saved-session picker.
+
+This project adds the manager overlay, the detail screen, the status bar, and background agents.
+It also adds the hidden terminal for background sessions, usage and context stats, notices,
+and the `/sessions` subcommands.
+
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). The license keeps the copyright notice of pi-parallel-sessions.
