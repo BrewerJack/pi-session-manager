@@ -37,7 +37,7 @@ export function isCtrl(data: string, key: "o" | "r" | "k" | "p" | "n"): boolean 
 	return data === codes[key] || matchesKey(data, Key.ctrl(key));
 }
 
-export function padVisible(text: string, width: number): string {
+function padVisible(text: string, width: number): string {
 	const truncated = truncateToWidth(text, width, "…");
 	return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
 }
@@ -69,7 +69,7 @@ function normalizeExistingDir(input: string): string | null {
 	}
 }
 
-export function relativeTime(date: Date): string {
+function relativeTime(date: Date): string {
 	const ms = Date.now() - date.getTime();
 	if (!Number.isFinite(ms) || ms < 0) return "now";
 	const sec = Math.floor(ms / 1000);
@@ -334,8 +334,10 @@ export class FileExplorer implements Component, Focusable {
 		const start = this.visibleStart(entries.length);
 		const end = Math.min(entries.length, start + FILE_EXPLORER_MAX_VISIBLE);
 		for (let i = start; i < end; i++) {
+			const entry = entries[i];
+			if (!entry) continue;
 			lines.push(
-				this.entryLine(width, entries[i]!, {
+				this.entryLine(width, entry, {
 					selected: i === this.selectedIndex,
 				}),
 			);
@@ -368,11 +370,9 @@ export class FileExplorer implements Component, Focusable {
 				width - visibleWidth(renderedLeft) - visibleWidth(renderedMeta),
 			),
 		);
-		const styledLeft = !entry.isDirectory
-			? this.theme.fg("dim", renderedLeft)
-			: options.selected
-				? this.theme.fg("accent", renderedLeft)
-				: renderedLeft;
+		let styledLeft = renderedLeft;
+		if (!entry.isDirectory) styledLeft = this.theme.fg("dim", renderedLeft);
+		else if (options.selected) styledLeft = this.theme.fg("accent", renderedLeft);
 		return `${styledLeft}${gap}${this.theme.fg("dim", renderedMeta)}`;
 	}
 
@@ -604,7 +604,8 @@ export class ResumeSessionPicker implements Component, Focusable {
 			rendered = 1;
 		} else {
 			for (let i = startIdx; i < endIdx; i++) {
-				const session = visibleSessions[i]!;
+				const session = visibleSessions[i];
+				if (!session) continue;
 				const marker = i === this.selected ? "›" : " ";
 				const title =
 					session.name || session.firstMessage || session.id.slice(0, 8);

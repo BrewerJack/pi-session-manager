@@ -54,7 +54,7 @@ This check needs pi to run on the Mac itself.
 Over SSH, or when the Mac helper of pi is missing, set your terminal to send Option as Alt instead:
 
 | Terminal | Setting |
-|---|---|
+| --- | --- |
 | Terminal | Settings → Profiles → Keyboard → turn on **Use Option as Meta key**. |
 | iTerm2 | Settings → Profiles → Keys → set **Left Option key** to **Esc+**. |
 | Ghostty | Add `macos-option-as-alt = true` to the config file. |
@@ -82,7 +82,7 @@ Add a `sessionManager` key to `~/.pi/agent/settings.json`:
 ```
 
 | Key | Meaning |
-|---|---|
+| --- | --- |
 | `shortcut` | The key that opens the manager. It uses the pi key syntax, for example `alt+m` or `ctrl+alt+s`. The default is `alt+s`. |
 | `macOptionChars` | The characters that open the manager on macOS while you hold Option. The default is the US-layout character of the shortcut letter, for example `ß` for `alt+s`. Set it to `false` to turn the Mac fallback off. |
 
@@ -99,7 +99,7 @@ Each row shows one live session:
 ```
 
 | Icon | Meaning |
-|---|---|
+| --- | --- |
 | spinner | The agent works. The row shows its current tool. |
 | `?` | The agent waits for your answer. |
 | `✓` | The agent finished. |
@@ -113,7 +113,7 @@ A preview under the list shows the last prompt and the newest reply of the selec
 ### Keys
 
 | Key | Action |
-|---|---|
+| --- | --- |
 | `↑` `↓` | Select a session. |
 | `⏎` or `1`–`9` | Switch to a session. |
 | `→` | Open the detail screen. |

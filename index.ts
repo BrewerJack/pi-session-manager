@@ -146,7 +146,9 @@ export default function sessionManager(pi: ExtensionAPI) {
 
 	pi.on("agent_settled", (event, ctx) => {
 		const r = bind(ctx);
-		const outcome: Outcome = event.aborted ? "aborted" : r.error ? "error" : "done";
+		let outcome: Outcome = "done";
+		if (event.aborted) outcome = "aborted";
+		else if (r.error) outcome = "error";
 		finishRun(host, r, outcome);
 	});
 
@@ -333,14 +335,7 @@ function statusReport(host: SessionHost): string {
 	const lines = host.list().map((r, i) => {
 		const s = host.stats(r);
 		const activity = host.activity(r);
-		const state =
-			r.state === "error"
-				? `error: ${r.error}`
-				: activity === "working"
-					? `working ${r.runStartedAt ? fmtDuration(Date.now() - r.runStartedAt) : ""}${r.tool ? ` · ${r.tool.name}` : ""}`
-					: activity === "waiting"
-						? "needs input"
-						: (r.lastOutcome ?? "ready");
+		const state = describeState(r, activity);
 		const current = r.id === host.activeId ? " (current)" : "";
 		const usage = `${fmtTokens(s.input + s.output + s.cacheRead + s.cacheWrite)} tok · ${fmtCost(s.cost)}`;
 		return `${i + 1}. ${titleOf(r)}${current} · ${state} · ${shortPath(r.cwd)} · ${usage} · ${fmtAgo(r.lastActivityAt)}`;
@@ -348,28 +343,31 @@ function statusReport(host: SessionHost): string {
 	return [`${lines.length} live session(s):`, ...lines].join("\n");
 }
 
+function describeState(r: LiveSession, activity: string): string {
+	if (r.state === "error") return `error: ${r.error}`;
+	if (activity === "waiting") return "needs input";
+	if (activity !== "working") return r.lastOutcome ?? "ready";
+	const elapsed = r.runStartedAt ? fmtDuration(Date.now() - r.runStartedAt) : "";
+	const tool = r.tool ? ` · ${r.tool.name}` : "";
+	return `working ${elapsed}${tool}`;
+}
+
 function completeArgs(host: SessionHost, prefix: string) {
 	const [sub = "", ...rest] = prefix.split(/\s+/);
 	if (!rest.length) {
-		const items = SUBCOMMANDS.filter(([name]) => name.startsWith(sub)).map(([name, description]) => ({
-			value: `${name} `,
-			label: name,
-			description,
-		}));
+		const items = SUBCOMMANDS.flatMap(([name, description]) =>
+			name.startsWith(sub) ? [{ value: `${name} `, label: name, description }] : [],
+		);
 		return items.length ? items : null;
 	}
 	if (sub !== "switch" && sub !== "stop") return null;
 	const query = rest.join(" ").toLowerCase();
-	const items = host
-		.list()
-		.filter((r) => sub === "switch" || r.kind === "child")
-		.map((r) => ({ name: r.sessionName || titleOf(r), r }))
-		.filter(({ name }) => name.toLowerCase().includes(query))
-		.map(({ name, r }) => ({
-			value: `${sub} ${name}`,
-			label: name,
-			description: `${host.activity(r)} · ${shortPath(r.cwd)}`,
-		}));
+	const items = host.list().flatMap((r) => {
+		if (sub === "stop" && r.kind !== "child") return [];
+		const name = r.sessionName || titleOf(r);
+		if (!name.toLowerCase().includes(query)) return [];
+		return [{ value: `${sub} ${name}`, label: name, description: `${host.activity(r)} · ${shortPath(r.cwd)}` }];
+	});
 	return items.length ? items : null;
 }
 

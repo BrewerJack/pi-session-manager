@@ -54,7 +54,7 @@ export function canonicalPath(absolute: string): string {
 	}
 }
 
-export function normalizeLockPath(p: string, cwd: string): string | null {
+function normalizeLockPath(p: string, cwd: string): string | null {
 	if (!p || typeof p !== "string") return null;
 	const absolute = p.startsWith("~")
 		? path.join(os.homedir(), p.slice(1))
@@ -64,7 +64,7 @@ export function normalizeLockPath(p: string, cwd: string): string | null {
 
 // macOS and Windows file systems ignore case by default, so Foo.ts and foo.ts are one file.
 // On a case-sensitive volume, this only makes the locks a little stricter.
-export const CASE_INSENSITIVE_FS = process.platform === "darwin" || process.platform === "win32";
+const CASE_INSENSITIVE_FS = process.platform === "darwin" || process.platform === "win32";
 
 export function pathsConflict(rawA: string, rawB: string, caseInsensitive = CASE_INSENSITIVE_FS): boolean {
 	const a = caseInsensitive ? rawA.toLowerCase() : rawA;
@@ -84,9 +84,11 @@ export class LockManager {
 	}
 
 	acquire(sessionId: string, rawPaths: string[], cwd: string) {
-		const paths = [
-			...new Set(rawPaths.map((p) => normalizeLockPath(p, cwd)).filter((p): p is string => !!p)),
-		].sort();
+		const normalized = rawPaths.flatMap((p) => {
+			const resolved = normalizeLockPath(p, cwd);
+			return resolved ? [resolved] : [];
+		});
+		const paths = [...new Set(normalized)].sort((a, b) => a.localeCompare(b));
 		const conflicts: { path: string; heldPath: string; by: string }[] = [];
 		for (const p of paths) {
 			for (const [held, info] of this.locks.entries()) {
@@ -116,7 +118,7 @@ export class LockManager {
 	}
 
 	heldBy(sessionId: string): string[] {
-		return [...this.locks.entries()].filter(([, info]) => info.sessionId === sessionId).map(([p]) => p);
+		return [...this.locks.entries()].flatMap(([p, info]) => (info.sessionId === sessionId ? [p] : []));
 	}
 }
 

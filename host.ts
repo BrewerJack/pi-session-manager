@@ -13,6 +13,7 @@ import {
 	ProjectTrustStore,
 	SessionManager,
 	SettingsManager,
+	type CreateAgentSessionFromServicesOptions,
 } from "@earendil-works/pi-coding-agent";
 import { ProcessTerminal } from "@earendil-works/pi-tui";
 import { LockManager } from "./locks.ts";
@@ -23,17 +24,17 @@ export { debug } from "./log.ts";
 
 export const PARENT_ID = "__parent__";
 const HOST_KEY = "__PI_SESSION_MANAGER_HOST__";
-const SPINNER_PATCHED = Symbol.for("pi-session-manager.spinnerPatched");
+const SPINNER_PATCHED: unique symbol = Symbol.for("pi-session-manager.spinnerPatched");
 const STATS_TTL_MS = 1000;
 
 type Ctx = any;
 type Api = any;
 
 export type Activity = "idle" | "working" | "waiting";
-export type LiveState = "active" | "background" | "starting" | "stopped" | "error";
+type LiveState = "active" | "background" | "starting" | "stopped" | "error";
 export type Outcome = "done" | "aborted" | "error";
 
-export interface ToolActivity {
+interface ToolActivity {
 	id: string;
 	name: string;
 	detail: string;
@@ -101,8 +102,7 @@ export function textOf(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
 	return content
-		.filter((part: any) => part?.type === "text" && typeof part.text === "string")
-		.map((part: any) => part.text)
+		.flatMap((part: any) => (part?.type === "text" && typeof part.text === "string" ? [part.text] : []))
 		.join(" ");
 }
 
@@ -160,6 +160,11 @@ function resetExtendedKeyboardModesForHandoff(): void {
 // Runtime inheritance: children start with the model, thinking level, and tools
 // of the session that created them.
 
+/** The options that a child session takes over from the session that created it. */
+type ChildSessionOptions = Partial<
+	Pick<CreateAgentSessionFromServicesOptions, "model" | "thinkingLevel" | "scopedModels" | "tools">
+>;
+
 let modelResolverPromise: Promise<any> | null = null;
 const inheritanceBySessionManager = new WeakMap<object, any>();
 
@@ -167,18 +172,19 @@ async function loadModelResolver(): Promise<any> {
 	modelResolverPromise ??= import(
 		pathToFileURL(path.join(getPackageDir(), "dist/core/model-resolver.js")).href
 	);
-	return await modelResolverPromise;
+	return modelResolverPromise;
 }
 
 function sameModel(a: any, b: any): boolean {
-	return !!a && !!b && a.provider === b.provider && a.id === b.id;
+	if (!a || !b) return false;
+	return a.provider === b.provider && a.id === b.id;
 }
 
 function hasExistingMessages(sessionManager: any): boolean {
 	return (sessionManager.buildSessionContext?.().messages?.length ?? 0) > 0;
 }
 
-export function collectInheritance(ctx?: Ctx): any {
+function collectInheritance(ctx?: Ctx): any {
 	if (!ctx) return {};
 	try {
 		const promptOptions = ctx.getSystemPromptOptions?.() ?? {};
@@ -212,16 +218,22 @@ function createInheritedSettingsManager(cwd: string, agentDir: string, inheritan
 	return { settingsManager: SettingsManager.create(cwd, agentDir, { projectTrusted }), diagnostics };
 }
 
-async function resolveChildSessionOptions(services: any, sessionManager: any, inheritance: any): Promise<any> {
-	const options: any = { ...(inheritance?.sessionOptions ?? {}) };
+async function resolveChildSessionOptions(
+	services: any,
+	sessionManager: any,
+	inheritance: any,
+): Promise<ChildSessionOptions> {
+	const inherited: ChildSessionOptions = { ...(inheritance?.sessionOptions ?? {}) };
+	const existing = hasExistingMessages(sessionManager);
+	// A session with history keeps its own model and thinking level.
+	let options: ChildSessionOptions = { ...inherited };
+	if (existing) {
+		options = {};
+		if (inherited.tools) options.tools = inherited.tools;
+	}
 	// Each child owns its model runtime. Look the inherited model up there.
 	if (options.model) {
 		options.model = services.modelRegistry?.find?.(options.model.provider, options.model.id) ?? options.model;
-	}
-	const existing = hasExistingMessages(sessionManager);
-	if (existing) {
-		delete options.model;
-		delete options.thinkingLevel;
 	}
 	const patterns = services.settingsManager?.getEnabledModels?.();
 	if (!patterns?.length) return options;
@@ -281,7 +293,7 @@ const createRuntime = async ({ cwd, agentDir, sessionManager, sessionStartEvent 
 // gate stays closed, it drops output and input. A child can therefore run, bind
 // extensions, and keep its TUI current in the background. It never touches the screen.
 
-export class GatedTerminal {
+class GatedTerminal {
 	private readonly inner: any = new ProcessTerminal();
 	private open = false;
 	private innerStarted = false;
@@ -381,7 +393,7 @@ export class GatedTerminal {
 // ChildView drives one child InteractiveMode. Every child starts headless.
 // The show() and hide() methods move the real terminal in and out.
 
-export class ChildView {
+class ChildView {
 	shown = false;
 	stopped = false;
 
@@ -502,10 +514,12 @@ export class SessionHost {
 	/** Shortcut warnings reached the user once. */
 	warnedKeys = false;
 	private notifyScheduled = false;
+	/** The main session. It lives as long as the process. */
+	readonly parent: LiveSession;
 
 	constructor() {
 		const now = Date.now();
-		this.records.set(PARENT_ID, {
+		this.parent = {
 			id: PARENT_ID,
 			kind: "parent",
 			cwd: process.cwd(),
@@ -517,7 +531,8 @@ export class SessionHost {
 			promptDepth: 0,
 			ownPromptPending: 0,
 			ignoredPromptEnds: 0,
-		});
+		};
+		this.records.set(PARENT_ID, this.parent);
 	}
 
 	get(idOrName: string): LiveSession | undefined {
@@ -534,9 +549,8 @@ export class SessionHost {
 	}
 
 	list(): LiveSession[] {
-		const parent = this.records.get(PARENT_ID)!;
 		const children = [...this.records.values()].filter((r) => r.kind === "child" && r.state !== "stopped");
-		return [parent, ...children];
+		return [this.parent, ...children];
 	}
 
 	subscribe(listener: () => void): () => void {
@@ -618,15 +632,12 @@ export class SessionHost {
 		const matches = (r: LiveSession) =>
 			(sessionId && r.sessionId === sessionId) || (sessionFile && r.sessionFile === sessionFile);
 		let record = [...this.records.values()].find((r) => r.kind === "child" && matches(r));
-		if (!record) {
-			const parent = this.records.get(PARENT_ID)!;
-			if (matches(parent)) record = parent;
-		}
+		if (!record && matches(this.parent)) record = this.parent;
 		if (!record) {
 			// /new or /resume inside the active child changes its identity before we
 			// can match it. Route that context to the active child, or else to the parent.
 			const active = this.activeId !== PARENT_ID ? this.records.get(this.activeId) : undefined;
-			record = active?.kind === "child" ? active : this.records.get(PARENT_ID)!;
+			record = active?.kind === "child" ? active : this.parent;
 		}
 		record.context = ctx;
 		if (pi) record.pi = pi;
@@ -669,14 +680,14 @@ export class SessionHost {
 		this.notify();
 		inheritanceBySessionManager.set(sessionManager, inheritance);
 		try {
-			const runtime = await createAgentSessionRuntime(createRuntime as any, {
+			const runtime = await createAgentSessionRuntime(createRuntime, {
 				cwd: opts.cwd,
 				agentDir: getAgentDir(),
 				sessionManager,
-				sessionStartEvent: { type: "session_start", reason: "startup" } as any,
+				sessionStartEvent: { type: "session_start", reason: "startup" },
 			});
 			const terminal = new GatedTerminal();
-			const mode = new (InteractiveMode as any)(runtime, {
+			const mode = new InteractiveMode(runtime, {
 				migratedProviders: [],
 				modelFallbackMessage: runtime.modelFallbackMessage,
 				initialMessage: opts.task?.trim() || undefined,
@@ -707,7 +718,7 @@ export class SessionHost {
 		if (existing) return existing;
 		const sessionManager = SessionManager.open(sessionPath, undefined, undefined);
 		const cwd = sessionManager.getCwd?.() || process.cwd();
-		return await this.createChild({ cwd, ctx, sessionManager });
+		return this.createChild({ cwd, ctx, sessionManager });
 	}
 
 	async stopChild(idOrName: string): Promise<void> {
@@ -779,7 +790,7 @@ export class SessionHost {
 	/** The parent TUI is not ours to stop directly. Park it inside a custom UI. */
 	async enterFromParent(ctx: Ctx, targetId: string): Promise<void> {
 		if (this.parentHandoffActive) return this.activate(targetId);
-		const parent = this.records.get(PARENT_ID)!;
+		const parent = this.parent;
 		parent.ownPromptPending++;
 		await ctx.ui.custom((tui: any, _theme: any, _kb: any, done: () => void) => {
 			this.parentTui = tui;
@@ -982,7 +993,8 @@ export class SessionHost {
 		if (record.running && record.streamingText?.trim()) return record.streamingText.trim();
 		const items = this.transcript(record, 40);
 		for (let i = items.length - 1; i >= 0; i--) {
-			if (items[i]!.kind === "assistant") return items[i]!.text;
+			const item = items[i];
+			if (item?.kind === "assistant") return item.text;
 		}
 		return undefined;
 	}
@@ -990,7 +1002,8 @@ export class SessionHost {
 	lastPrompt(record: LiveSession): string | undefined {
 		const items = this.transcript(record, 80);
 		for (let i = items.length - 1; i >= 0; i--) {
-			if (items[i]!.kind === "user") return oneLine(items[i]!.text);
+			const item = items[i];
+			if (item?.kind === "user") return oneLine(item.text);
 		}
 		return record.firstPrompt;
 	}
@@ -1001,17 +1014,29 @@ export function titleOf(record: LiveSession): string {
 }
 
 export function getHost(): SessionHost {
-	const g = globalThis as any;
-	if (!g[HOST_KEY]) g[HOST_KEY] = new SessionHost();
-	return g[HOST_KEY];
+	// One host per process, shared by the extension instances of every session.
+	const g = globalThis as typeof globalThis & Record<string, SessionHost | undefined>;
+	const host = g[HOST_KEY] ?? new SessionHost();
+	g[HOST_KEY] = host;
+	return host;
+}
+
+type IndicatorOptions = { frames?: string[]; intervalMs?: number };
+
+/** The members of InteractiveMode.prototype that the spinner patch touches. */
+interface PatchableMode {
+	setWorkingIndicator?: (this: unknown, options?: IndicatorOptions) => unknown;
+	[SPINNER_PATCHED]?: boolean;
 }
 
 /** Mirror the working-indicator frames of pi, so the status bar spinner matches. */
 export function patchWorkingIndicator(host: SessionHost): void {
-	const proto = (InteractiveMode as any)?.prototype;
-	if (!proto || proto[SPINNER_PATCHED] || typeof proto.setWorkingIndicator !== "function") return;
+	// SAFETY: setWorkingIndicator is a private method of InteractiveMode. The typeof check
+	// below skips the patch if a pi release renames or removes it.
+	const proto = InteractiveMode.prototype as unknown as PatchableMode;
+	if (proto[SPINNER_PATCHED] || typeof proto.setWorkingIndicator !== "function") return;
 	const original = proto.setWorkingIndicator;
-	proto.setWorkingIndicator = function (options?: { frames?: string[]; intervalMs?: number }) {
+	proto.setWorkingIndicator = function (this: unknown, options?: IndicatorOptions) {
 		const source = [...host.records.values()].find((r) => r.mode === this);
 		const teardown =
 			options === undefined && source !== undefined && (source.expectedStop || source.state === "stopped");

@@ -8,7 +8,7 @@ import { readFileSync } from "node:fs";
 export const DEFAULT_SHORTCUT = "alt+s";
 
 /** What Option+letter types on the US and ABC layouts. The map skips the dead keys e, i, n, and u. */
-export const US_OPTION_CHARS: Readonly<Record<string, string>> = {
+const US_OPTION_CHARS: Readonly<Record<string, string>> = {
 	a: "å",
 	b: "∫",
 	c: "ç",
@@ -49,7 +49,8 @@ export function isValidShortcut(key: string): boolean {
 
 export function optionCharsFor(shortcut: string): string[] {
 	const match = /^alt\+([a-z])$/.exec(shortcut);
-	const char = match ? US_OPTION_CHARS[match[1]!] : undefined;
+	const letter = match?.[1];
+	const char = letter ? US_OPTION_CHARS[letter] : undefined;
 	return char ? [char] : [];
 }
 

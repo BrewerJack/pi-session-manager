@@ -73,7 +73,8 @@ export function fmtAgo(ts: number): string {
 
 export function shortPath(p: string): string {
 	const home = homedir();
-	return p === home ? "~" : p.startsWith(home + "/") ? `~${p.slice(home.length)}` : p;
+	if (p === home) return "~";
+	return p.startsWith(home + "/") ? `~${p.slice(home.length)}` : p;
 }
 
 function fit(text: string, width: number): string {
@@ -111,7 +112,7 @@ function wrap(text: string, width: number): string[] {
 function spinnerFrame(host: SessionHost, theme: Theme, frame: number): string {
 	const frames = host.workingIndicator?.frames;
 	if (frames !== undefined) return frames.length ? (frames[frame % frames.length] ?? "") : "";
-	return theme.fg("accent", SPINNER[frame % SPINNER.length]!);
+	return theme.fg("accent", SPINNER[frame % SPINNER.length] ?? "");
 }
 
 function statusIcon(host: SessionHost, r: LiveSession, theme: Theme, frame: number): string {
@@ -331,7 +332,8 @@ export class ManagerView implements Component, Focusable {
 		const list = this.sessions();
 		if (!list.length) return;
 		const index = Math.max(0, list.findIndex((r) => r.id === this.selected()?.id));
-		const next = list[(index + delta + list.length) % list.length]!;
+		const next = list[(index + delta + list.length) % list.length];
+		if (!next) return;
 		this.selectedId = next.id;
 		this.detailScroll = 0;
 		this.requestRender();
@@ -669,12 +671,13 @@ export class ManagerView implements Component, Focusable {
 		const th = this.theme;
 		if (this.prompt) {
 			const target = this.prompt.targetId ? this.host.get(this.prompt.targetId) : undefined;
-			const label =
-				this.prompt.kind === "new"
-					? "New agent task (empty opens a blank session)"
-					: this.prompt.kind === "rename"
-						? `Rename "${target ? titleOf(target) : "session"}"`
-						: `Message to "${target ? titleOf(target) : "session"}"`;
+			const name = target ? titleOf(target) : "session";
+			const labels = {
+				new: "New agent task (empty opens a blank session)",
+				rename: `Rename "${name}"`,
+				message: `Message to "${name}"`,
+			};
+			const label = labels[this.prompt.kind];
 			out.push(box.sep(label));
 			const prefix = th.fg("accent", "❯ ");
 			out.push(box.line(prefix + renderInputChild(this.prompt.input, box.inner - 2)));
@@ -692,11 +695,13 @@ export class ManagerView implements Component, Focusable {
 			);
 			return;
 		}
-		if (this.busy || this.flash) {
+		if (this.busy) {
 			out.push(box.sep());
-			const text = this.busy ? `${spinnerFrame(this.host, th, this.frame)} working…` : this.flash!.text;
-			const color = this.busy ? "muted" : this.flash!.type === "info" ? "success" : this.flash!.type;
-			out.push(box.line(th.fg(color, text)));
+			out.push(box.line(th.fg("muted", `${spinnerFrame(this.host, th, this.frame)} working…`)));
+		} else if (this.flash) {
+			out.push(box.sep());
+			const color = this.flash.type === "info" ? "success" : this.flash.type;
+			out.push(box.line(th.fg(color, this.flash.text)));
 		}
 	}
 
@@ -766,7 +771,8 @@ export class ManagerView implements Component, Focusable {
 		const icon = statusIcon(this.host, r, th, this.frame);
 		const num = index < 9 ? th.fg("dim", `${index + 1}`) : " ";
 		let title = titleOf(r);
-		title = selected ? th.bold(th.fg("accent", title)) : r.unread ? th.bold(title) : title;
+		if (selected) title = th.bold(th.fg("accent", title));
+		else if (r.unread) title = th.bold(title);
 		const tags: string[] = [];
 		if (current) tags.push(th.fg("dim", "(current)"));
 		if (r.kind === "parent") tags.push(th.fg("dim", "main"));
@@ -870,9 +876,8 @@ export class ManagerView implements Component, Focusable {
 		while (view.length < avail) view.push("");
 		out.push(...view.map((l) => box.line(l)));
 		this.renderFooterArea(box, out);
-		const scrollInfo = maxScroll
-			? th.fg("dim", this.detailScroll ? `↑ ${this.detailScroll} lines up` : "following")
-			: "";
+		const scrollText = this.detailScroll ? `↑ ${this.detailScroll} lines up` : "following";
+		const scrollInfo = maxScroll ? th.fg("dim", scrollText) : "";
 		out.push(box.bottom(scrollInfo));
 		out.push(
 			hints(
@@ -898,7 +903,9 @@ export class ManagerView implements Component, Focusable {
 		if (percent == null) return th.fg("dim", "unknown");
 		const n = Math.max(4, cells);
 		const filled = Math.round((Math.min(100, percent) / 100) * n);
-		const color = percent < 50 ? "success" : percent < 80 ? "warning" : "error";
+		let color = "error";
+		if (percent < 50) color = "success";
+		else if (percent < 80) color = "warning";
 		const bar = th.fg(color, "█".repeat(filled)) + th.fg("dim", "░".repeat(n - filled));
 		const total = window ? ` of ${fmtTokens(window)}` : "";
 		return `${bar} ${Math.round(percent)}%${total}`;
@@ -956,7 +963,8 @@ export class StatusBar implements Component {
 		const segments = sessions.map((r) => {
 			const current = r.id === this.host.activeId;
 			const name = fit(r.sessionName || (r.kind === "parent" ? "main" : titleOf(r)), 20);
-			const styled = current ? th.bold(th.fg("accent", name)) : r.unread ? th.fg("text", name) : th.fg("muted", name);
+			let styled = th.fg(r.unread ? "text" : "muted", name);
+			if (current) styled = th.bold(th.fg("accent", name));
 			const dot = r.unread ? th.fg("accent", "•") : "";
 			return `${statusIcon(this.host, r, th, this.frame)} ${styled}${dot}`;
 		});
