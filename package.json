@@ -1,5 +1,5 @@
 {
-	"name": "pi-session-manager",
+	"name": "@therealbrewerjack/pi-session-manager",
 	"version": "0.1.0",
 	"description": "Run several agent sessions in one pi process and manage them from a Claude-Code-style overlay",
 	"type": "module",

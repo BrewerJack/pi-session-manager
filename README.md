@@ -12,6 +12,12 @@ Manage them from one overlay, like the session view of the Claude Code CLI.
 ## Install
 
 ```bash
+pi install npm:@therealbrewerjack/pi-session-manager
+```
+
+Or install from GitHub:
+
+```bash
 pi install git:github.com/BrewerJack/pi-session-manager
 ```
 
