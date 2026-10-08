@@ -1,6 +1,6 @@
 {
 	"name": "@therealbrewerjack/pi-session-manager",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Run several agent sessions in one pi process and manage them from a Claude-Code-style overlay",
 	"type": "module",
 	"license": "MIT",
@@ -10,8 +10,21 @@
 		"url": "git+https://github.com/BrewerJack/pi-session-manager.git"
 	},
 	"homepage": "https://github.com/BrewerJack/pi-session-manager#readme",
-	"keywords": ["pi-package", "pi", "pi-agent", "sessions", "agents"],
-	"files": ["index.ts", "host.ts", "ui.ts", "pickers.ts", "README.md", "LICENSE"],
+	"keywords": [
+		"pi-package",
+		"pi",
+		"pi-agent",
+		"sessions",
+		"agents"
+	],
+	"files": [
+		"index.ts",
+		"host.ts",
+		"ui.ts",
+		"pickers.ts",
+		"README.md",
+		"LICENSE"
+	],
 	"scripts": {
 		"typecheck": "tsc -p tsconfig.json"
 	},
@@ -26,6 +39,8 @@
 		"typescript": "^5.6.0"
 	},
 	"pi": {
-		"extensions": ["./index.ts"]
+		"extensions": [
+			"./index.ts"
+		]
 	}
 }
