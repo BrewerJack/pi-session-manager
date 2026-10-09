@@ -20,6 +20,7 @@ import {
 	type Outcome,
 	type SessionHost,
 } from "./host.ts";
+import { formatBreakdown, type FooterEntry } from "./footer.ts";
 import { displayKey, isMacOptionShortcut, loadKeyConfig, type KeyConfig, type ModifierProbe } from "./keys.ts";
 import { fmtAgo, fmtCost, fmtDuration, fmtTokens, ManagerView, shortPath, StatusBar, type ManagerResult } from "./ui.ts";
 
@@ -28,6 +29,7 @@ let KEYS: KeyConfig = loadKeyConfig(path.join(getAgentDir(), "settings.json"), p
 /** The shortcut as the platform writes it, for hints and notices. */
 let SHORTCUT = displayKey(KEYS.shortcut, process.platform);
 const WIDGET_KEY = "pi-session-manager";
+const FOOTER_KEY = "pi-session-manager";
 const SUBCOMMANDS: [string, string][] = [
 	["new", "Start an agent. With a task, it runs in the background."],
 	["list", "Show the status of every live session"],
@@ -44,9 +46,8 @@ export default function sessionManager(pi: ExtensionAPI) {
 	patchWorkingIndicator(host);
 	KEYS = loadKeyConfig(path.join(getAgentDir(), "settings.json"), process.env);
 	SHORTCUT = displayKey(KEYS.shortcut, process.platform);
-	let stopMacKeys: (() => void) | undefined;
-
-	const bind = (ctx: Ctx): LiveSession => host.bind(ctx, pi);
+	const cleanup: Cleanup = {};
+	const bind: Bind = (ctx) => host.bind(ctx, pi);
 
 	pi.registerCommand("sessions", {
 		description: "Manage live agent sessions (new, list, switch, rename, stop, resume)",
@@ -60,25 +61,23 @@ export default function sessionManager(pi: ExtensionAPI) {
 		handler: async (ctx: ExtensionContext) => openManager(pi, host, ctx),
 	});
 
+	registerSessionEvents(pi, host, bind, cleanup);
+	registerRunEvents(pi, host, bind);
+	registerPromptEvents(pi, host, bind);
+	registerLockEvents(pi, host, bind);
+}
+
+type Bind = (ctx: Ctx) => LiveSession;
+/** Stop functions for the per-session parts that session_shutdown must remove. */
+type Cleanup = { macKeys?: () => void; footer?: () => void };
+
+/** Session start, metadata changes, and shutdown. */
+function registerSessionEvents(pi: ExtensionAPI, host: SessionHost, bind: Bind, cleanup: Cleanup): void {
 	pi.on("session_start", (event, ctx) => {
 		const r = bind(ctx);
 		// A main session that opens from a file brings back its child sessions as saved rows.
-		if (r.kind === "parent" && event.reason !== "reload") {
-			const restored = host.loadMembership(ctx, event.reason);
-			if (restored && ctx.hasUI) {
-				const what = restored === 1 ? "1 saved session" : `${restored} saved sessions`;
-				ctx.ui.notify(`Restored ${what}. Press ${SHORTCUT} to open one.`, "info");
-			}
-		}
-		if (ctx.mode === "tui") {
-			installStatusBar(ctx, host);
-			stopMacKeys?.();
-			stopMacKeys = installMacOptionKey(pi, host, ctx);
-			if (!host.warnedKeys) {
-				host.warnedKeys = true;
-				for (const warning of KEYS.warnings) ctx.ui.notify(warning, "warning");
-			}
-		}
+		if (r.kind === "parent" && event.reason !== "reload") restoreChildren(host, ctx, event.reason);
+		if (ctx.mode === "tui") installSessionUi(pi, host, ctx, cleanup);
 		host.notify();
 	});
 
@@ -98,6 +97,26 @@ export default function sessionManager(pi: ExtensionAPI) {
 		host.notifySoon();
 	});
 
+	pi.on("session_shutdown", (_event, ctx) => {
+		const r = bind(ctx);
+		// The delayed save may not run before pi exits.
+		if (r.kind === "parent") host.persistMembership();
+		host.locks.release(r.id);
+		cleanup.macKeys?.();
+		cleanup.macKeys = undefined;
+		cleanup.footer?.();
+		cleanup.footer = undefined;
+		try {
+			ctx.ui.setWidget(WIDGET_KEY, undefined);
+		} catch (error) {
+			debug(error);
+		}
+		host.notify();
+	});
+}
+
+/** Track each run: start, streaming text, tools, and the outcome. */
+function registerRunEvents(pi: ExtensionAPI, host: SessionHost, bind: Bind): void {
 	pi.on("agent_start", (_event, ctx) => {
 		const r = bind(ctx);
 		const now = Date.now();
@@ -159,7 +178,10 @@ export default function sessionManager(pi: ExtensionAPI) {
 		else if (r.error) outcome = "error";
 		finishRun(host, r, outcome);
 	});
+}
 
+/** Count dialogs that wait for the user, so the manager can show "needs input". */
+function registerPromptEvents(pi: ExtensionAPI, host: SessionHost, bind: Bind): void {
 	pi.on("ui_prompt_start", (event, ctx) => {
 		const r = bind(ctx);
 		// Our own overlay and the parent handoff are custom UIs too. Skip them.
@@ -188,7 +210,10 @@ export default function sessionManager(pi: ExtensionAPI) {
 		if (!r.promptDepth) r.promptTitle = undefined;
 		host.notify();
 	});
+}
 
+/** Hold path locks for the duration of each write. */
+function registerLockEvents(pi: ExtensionAPI, host: SessionHost, bind: Bind): void {
 	pi.on("tool_call", (event, ctx) => {
 		const r = bind(ctx);
 		const paths = inferToolPaths(event.toolName, event.input);
@@ -210,21 +235,25 @@ export default function sessionManager(pi: ExtensionAPI) {
 		host.locks.releaseByToolCall(event.toolCallId);
 		return undefined;
 	});
+}
 
-	pi.on("session_shutdown", (_event, ctx) => {
-		const r = bind(ctx);
-		// The delayed save may not run before pi exits.
-		if (r.kind === "parent") host.persistMembership();
-		host.locks.release(r.id);
-		stopMacKeys?.();
-		stopMacKeys = undefined;
-		try {
-			ctx.ui.setWidget(WIDGET_KEY, undefined);
-		} catch (error) {
-			debug(error);
-		}
-		host.notify();
-	});
+function restoreChildren(host: SessionHost, ctx: ExtensionContext, reason: string): void {
+	const restored = host.loadMembership(ctx, reason);
+	if (!restored || !ctx.hasUI) return;
+	const what = restored === 1 ? "1 saved session" : `${restored} saved sessions`;
+	ctx.ui.notify(`Restored ${what}. Press ${SHORTCUT} to open one.`, "info");
+}
+
+/** The status bar, the footer breakdown, and the macOS shortcut of one session. */
+function installSessionUi(pi: ExtensionAPI, host: SessionHost, ctx: ExtensionContext, cleanup: Cleanup): void {
+	installStatusBar(ctx, host);
+	cleanup.footer?.();
+	cleanup.footer = installFooterBreakdown(pi, host, ctx);
+	cleanup.macKeys?.();
+	cleanup.macKeys = installMacOptionKey(pi, host, ctx);
+	if (host.warnedKeys) return;
+	host.warnedKeys = true;
+	for (const warning of KEYS.warnings) ctx.ui.notify(warning, "warning");
 }
 
 function finishRun(host: SessionHost, r: LiveSession, outcome: Outcome): void {
@@ -281,6 +310,53 @@ function installMacOptionKey(pi: ExtensionAPI, host: SessionHost, ctx: Extension
 		void openManager(pi, host, ctx).catch((error) => debug(error));
 		return { consume: true };
 	});
+}
+
+/**
+ * Keep a per-session token breakdown in the footer of this session. Each session has its
+ * own footer, so every session runs this for itself. Updates come at most once a second.
+ */
+function installFooterBreakdown(pi: ExtensionAPI, host: SessionHost, ctx: ExtensionContext): () => void {
+	const self = host.bind(ctx, pi).id;
+	let shown = "";
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const update = () => {
+		timer = undefined;
+		const entries: FooterEntry[] = host.list().map((r) => {
+			const s = host.stats(r);
+			return {
+				name: r.sessionName || (r.kind === "parent" ? "main" : titleOf(r)),
+				tokens: s.input + s.output + s.cacheRead + s.cacheWrite,
+				contextPercent: s.contextPercent,
+				cost: s.cost,
+				current: r.id === self,
+				saved: r.state === "saved",
+			};
+		});
+		const text = formatBreakdown(entries, ctx.ui.theme);
+		if (text === shown) return;
+		shown = text;
+		try {
+			ctx.ui.setStatus(FOOTER_KEY, text || undefined);
+		} catch (error) {
+			debug(error);
+		}
+	};
+	const unsubscribe = host.subscribe(() => {
+		timer ??= setTimeout(update, 1000);
+		timer.unref?.();
+	});
+	update();
+	return () => {
+		unsubscribe();
+		if (timer) clearTimeout(timer);
+		timer = undefined;
+		try {
+			ctx.ui.setStatus(FOOTER_KEY, undefined);
+		} catch (error) {
+			debug(error);
+		}
+	};
 }
 
 function installStatusBar(ctx: ExtensionContext, host: SessionHost): void {
@@ -382,62 +458,74 @@ function completeArgs(host: SessionHost, prefix: string) {
 	return items.length ? items : null;
 }
 
+type SubcommandHandler = (pi: ExtensionAPI, host: SessionHost, ctx: ExtensionCommandContext, value: string) => Promise<void>;
+
+async function newCommand(_pi: ExtensionAPI, host: SessionHost, ctx: ExtensionCommandContext, value: string): Promise<void> {
+	const cwd = ctx.cwd || process.cwd();
+	if (!value) {
+		const child = await host.createChild({ cwd, ctx });
+		await applyResult(host, ctx, { type: "switch", id: child.id });
+		return;
+	}
+	const child = await host.createChild({ cwd, ctx, task: value });
+	ctx.ui.notify(`Started agent "${titleOf(child)}" in the background. Press ${SHORTCUT} to manage it.`, "info");
+}
+
+async function listCommand(_pi: ExtensionAPI, host: SessionHost, ctx: ExtensionCommandContext): Promise<void> {
+	ctx.ui.notify(statusReport(host), "info");
+}
+
+async function switchCommand(_pi: ExtensionAPI, host: SessionHost, ctx: ExtensionCommandContext, value: string): Promise<void> {
+	const target = value ? host.get(value) : undefined;
+	if (!target) {
+		ctx.ui.notify(value ? `No live session matches "${value}".` : "Usage: /sessions switch <name>", "warning");
+		return;
+	}
+	await applyResult(host, ctx, { type: "switch", id: target.id });
+}
+
+async function renameCommand(pi: ExtensionAPI, host: SessionHost, ctx: ExtensionCommandContext, value: string): Promise<void> {
+	if (!value) {
+		ctx.ui.notify("Usage: /sessions rename <new name>", "warning");
+		return;
+	}
+	host.rename(host.bind(ctx, pi), value);
+	ctx.ui.notify(`Renamed this session to "${value}".`, "info");
+}
+
+async function stopCommand(_pi: ExtensionAPI, host: SessionHost, ctx: ExtensionCommandContext, value: string): Promise<void> {
+	const target = value ? host.get(value) : undefined;
+	if (!target || target.kind !== "child") {
+		ctx.ui.notify(value ? `No live child session matches "${value}".` : "Usage: /sessions stop <name>", "warning");
+		return;
+	}
+	const title = titleOf(target);
+	await host.stopChild(target.id);
+	ctx.ui.notify(`Stopped "${title}".`, "info");
+}
+
+const SUBCOMMAND_HANDLERS: Record<string, SubcommandHandler> = {
+	"": (pi, host, ctx) => openManager(pi, host, ctx),
+	new: newCommand,
+	list: listCommand,
+	status: listCommand,
+	switch: switchCommand,
+	rename: renameCommand,
+	stop: stopCommand,
+	kill: stopCommand,
+	resume: (pi, host, ctx) => openManager(pi, host, ctx, "resume"),
+};
+
 async function runCommand(pi: ExtensionAPI, host: SessionHost, args: string, ctx: ExtensionCommandContext) {
 	const [sub = "", ...rest] = args.split(/\s+/);
-	const value = rest.join(" ").trim();
 	host.bind(ctx, pi);
+	const handler = SUBCOMMAND_HANDLERS[sub.toLowerCase()];
+	if (!handler) {
+		ctx.ui.notify(`Unknown subcommand "${sub}". Try: ${SUBCOMMANDS.map(([n]) => n).join(", ")}.`, "warning");
+		return;
+	}
 	try {
-		switch (sub.toLowerCase()) {
-			case "":
-				return await openManager(pi, host, ctx);
-			case "new": {
-				const cwd = ctx.cwd || process.cwd();
-				if (!value) {
-					const child = await host.createChild({ cwd, ctx });
-					return await applyResult(host, ctx, { type: "switch", id: child.id });
-				}
-				const child = await host.createChild({ cwd, ctx, task: value });
-				ctx.ui.notify(`Started agent "${titleOf(child)}" in the background. Press ${SHORTCUT} to manage it.`, "info");
-				return;
-			}
-			case "list":
-			case "status":
-				ctx.ui.notify(statusReport(host), "info");
-				return;
-			case "switch": {
-				const target = value ? host.get(value) : undefined;
-				if (!target) {
-					ctx.ui.notify(value ? `No live session matches "${value}".` : "Usage: /sessions switch <name>", "warning");
-					return;
-				}
-				return await applyResult(host, ctx, { type: "switch", id: target.id });
-			}
-			case "rename": {
-				if (!value) {
-					ctx.ui.notify("Usage: /sessions rename <new name>", "warning");
-					return;
-				}
-				host.rename(host.bind(ctx, pi), value);
-				ctx.ui.notify(`Renamed this session to "${value}".`, "info");
-				return;
-			}
-			case "stop":
-			case "kill": {
-				const target = value ? host.get(value) : undefined;
-				if (!target || target.kind !== "child") {
-					ctx.ui.notify(value ? `No live child session matches "${value}".` : "Usage: /sessions stop <name>", "warning");
-					return;
-				}
-				const title = titleOf(target);
-				await host.stopChild(target.id);
-				ctx.ui.notify(`Stopped "${title}".`, "info");
-				return;
-			}
-			case "resume":
-				return await openManager(pi, host, ctx, "resume");
-			default:
-				ctx.ui.notify(`Unknown subcommand "${sub}". Try: ${SUBCOMMANDS.map(([n]) => n).join(", ")}.`, "warning");
-		}
+		await handler(pi, host, ctx, rest.join(" ").trim());
 	} catch (error: any) {
 		debug(error);
 		ctx.ui.notify(String(error?.message || error), "error");

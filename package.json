@@ -21,6 +21,7 @@
 	"files": [
 		"index.ts",
 		"host.ts",
+		"footer.ts",
 		"keys.ts",
 		"locks.ts",
 		"log.ts",

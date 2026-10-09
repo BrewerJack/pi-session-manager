@@ -173,6 +173,22 @@ Sessions that never got a message have no file, so they do not come back.
 
 When more than one session is live, a line under the editor shows every session and its state.
 
+## Token use in the footer
+
+The footer of pi shows the token use of the session on screen.
+With two or more sessions, the extension adds a line under it with every session:
+
+```text
+Σ 93k $1.42 │ main 4.4k 0.4% · fruit-bot 7.5k 2.2% · tests 81k 12%
+```
+
+- `Σ` is the total over all sessions: tokens (input, output, and cache) and cost.
+- Each part shows the tokens and the context use of one session.
+  The session on screen has the accent color.
+- Saved sessions have a `◇` mark. They show no context use, because they do not run yet.
+- The total comes first, because pi cuts the line at the screen width.
+- The line updates at most once a second.
+
 ## Safe parallel writes
 
 Two live sessions cannot write the same file or folder at the same time.

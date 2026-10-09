@@ -11,6 +11,7 @@ import {
 	type Component,
 	type Focusable,
 } from "@earendil-works/pi-tui";
+import { compactTokens } from "./footer.ts";
 import {
 	debug,
 	PARENT_ID,
@@ -40,12 +41,7 @@ const PREVIEW_ROWS = 5;
 // ---------------------------------------------------------------------------
 // Formatting helpers
 
-export function fmtTokens(n: number): string {
-	if (!Number.isFinite(n) || n <= 0) return "0";
-	if (n < 1000) return String(Math.round(n));
-	if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k`;
-	return `${(n / 1_000_000).toFixed(1)}M`;
-}
+export const fmtTokens = compactTokens;
 
 export function fmtCost(cost: number): string {
 	if (!cost) return "$0.00";
