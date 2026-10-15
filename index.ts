@@ -5,7 +5,7 @@
 // The extension runs in two modes (spec §11). In a worker, it belongs to a background
 // session, and the manager switches the client of the worker to another session. In plain
 // pi, it is a client: opening a session parks the TUI of pi and attaches the terminal.
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -15,16 +15,28 @@ import {
 	type ExtensionCommandContext,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { getNativeClipboard, type KeyId } from "@earendil-works/pi-tui";
+import { getNativeClipboard, type KeyId, type OverlayOptions } from "@earendil-works/pi-tui";
 import { attachLoop, describeEnd } from "./client.ts";
 import type { Inheritance } from "./control.ts";
 import { formatBreakdown, type FooterEntry } from "./footer.ts";
 import { displayKey, isMacOptionShortcut, loadKeyConfig, type KeyConfig, type ModifierProbe } from "./keys.ts";
 import { debug } from "./log.ts";
 import { statePaths, type BootContext } from "./paths.ts";
+import { Registry } from "./registry.ts";
 import { activityOf, RemoteSource, titleOf, type Row, type SessionSource } from "./remote-source.ts";
+import { readManagerSettings } from "./settings.ts";
 import { totalTokens } from "./transcript.ts";
-import { fmtAgo, fmtCost, fmtDuration, fmtTokens, ManagerView, shortPath, StatusBar, type ManagerResult } from "./ui.ts";
+import {
+	fmtAgo,
+	fmtCost,
+	fmtDuration,
+	fmtTokens,
+	ManagerView,
+	shortPath,
+	StatusBar,
+	type ManagerOptions,
+	type ManagerResult,
+} from "./ui.ts";
 import type { WorkerBridge } from "./worker.ts";
 
 // pi binds ctrl+r to app.session.rename, so the default is alt+s. Settings can change it.
@@ -42,10 +54,12 @@ const SUBCOMMANDS: [string, string][] = [
 	["rename", "Rename this session"],
 	["stop", "Stop a session by name. Its file stays."],
 	["resume", "Open a saved pi session file as a background session"],
+	["bg", "Move this session to the background and attach to it"],
 	["detach", "Leave this background session. It keeps running."],
 ];
 
 type Ctx = ExtensionContext | ExtensionCommandContext;
+type Notice = ManagerOptions["notice"];
 
 /** The worker that runs this session, when pi runs as a background worker (spec §7.4). */
 function workerBridge(): WorkerBridge | undefined {
@@ -83,12 +97,14 @@ interface Instance {
 	cleanup: (() => void)[];
 	managerOpen: boolean;
 	warnedKeys: boolean;
+	/** Plain pi runs the client loop of startDetached or of a routed resume. */
+	clientLoop: boolean;
 }
 
 export default function sessionManager(pi: ExtensionAPI) {
 	KEYS = loadKeyConfig(path.join(getAgentDir(), "settings.json"), process.env);
 	SHORTCUT = displayKey(KEYS.shortcut, process.platform);
-	const self: Instance = { pi, source: getSource(), cleanup: [], managerOpen: false, warnedKeys: false };
+	const self: Instance = { pi, source: getSource(), cleanup: [], managerOpen: false, warnedKeys: false, clientLoop: false };
 
 	pi.registerCommand("sessions", {
 		description: "Manage background sessions (new, list, open, rename, stop, resume, detach)",
@@ -102,8 +118,10 @@ export default function sessionManager(pi: ExtensionAPI) {
 		handler: async (ctx: ExtensionContext) => openManager(self, ctx),
 	});
 
-	pi.on("session_start", (_event, ctx) => {
-		if (ctx.mode === "tui") installSessionUi(self, ctx);
+	pi.on("session_start", (event, ctx) => {
+		if (ctx.mode !== "tui") return;
+		installSessionUi(self, ctx);
+		if (!workerBridge()) routeAtStart(self, event.reason, ctx);
 	});
 
 	pi.on("session_shutdown", () => {
@@ -266,29 +284,49 @@ function inheritFrom(ctx: Ctx): Inheritance {
 }
 
 async function openManager(self: Instance, ctx: Ctx, initial?: "resume" | "new"): Promise<void> {
-	const { source } = self;
 	if (ctx.mode !== "tui") {
-		ctx.ui.notify(statusReport(source), "info");
+		ctx.ui.notify(statusReport(self.source), "info");
 		return;
 	}
-	if (self.managerOpen) return;
+	const result = await showManager(self, ctx, { initial });
+	if (result?.type === "open") await openSession(self.source, ctx, result.id);
+}
+
+/** The manager overlay. `full` covers the whole screen, for the client loop of plain pi. */
+async function showManager(
+	self: Instance,
+	ctx: Ctx,
+	options: { initial?: "resume" | "new"; notice?: Notice; full?: boolean } = {},
+): Promise<ManagerResult> {
+	const { source } = self;
+	if (self.managerOpen) return undefined;
 	self.managerOpen = true;
 	// The user asks for sessions now. Start the supervisor if none runs.
 	source.ensureConnected().catch((error) => debug(error));
-	let result: ManagerResult;
+	const overlayOptions: OverlayOptions = options.full
+		? { width: "100%", maxHeight: "100%", anchor: "center" }
+		: { width: "94%", minWidth: 60, maxHeight: "92%", anchor: "center" };
 	try {
 		const show = () =>
 			ctx.ui.custom<ManagerResult>(
 				(tui, theme, _keybindings, done) =>
-					new ManagerView({ tui, theme, source, cwd: ctx.cwd || process.cwd(), done, initial, inherit: () => inheritFrom(ctx) }),
-				{ overlay: true, overlayOptions: { width: "94%", minWidth: 60, maxHeight: "92%", anchor: "center" } },
+					new ManagerView({
+						tui,
+						theme,
+						source,
+						cwd: ctx.cwd || process.cwd(),
+						done,
+						initial: options.initial,
+						notice: options.notice,
+						inherit: () => inheritFrom(ctx),
+					}),
+				{ overlay: true, overlayOptions },
 			);
 		const bridge = workerBridge();
-		result = bridge ? await bridge.ownPrompt(show) : await show();
+		return bridge ? await bridge.ownPrompt(show) : await show();
 	} finally {
 		self.managerOpen = false;
 	}
-	if (result?.type === "open") await openSession(source, ctx, result.id);
 }
 
 /** Show a session in this terminal. A worker hands its client over. Plain pi attaches. */
@@ -303,10 +341,16 @@ async function openSession(source: SessionSource, ctx: Ctx, id: string): Promise
 
 /**
  * Park the TUI of plain pi inside a custom UI and give the terminal to a worker. The TUI
- * comes back when the user detaches, and the notice says how the attach ended.
+ * comes back when the user detaches, and a notice says how the attach ended.
  */
 async function attachFromPi(source: SessionSource, ctx: Ctx, id: string): Promise<void> {
-	let ended: { text: string; type: "info" | "warning" | "error" } | undefined;
+	const ended = await attachParked(source, ctx, id);
+	if (ended) ctx.ui.notify(ended.text, ended.type);
+}
+
+/** The attach of attachFromPi. Returns how it ended instead of showing it. */
+async function attachParked(source: SessionSource, ctx: Ctx, id: string): Promise<Notice> {
+	let ended: Notice;
 	await ctx.ui.custom<void>((tui, _theme, _keybindings, done) => {
 		try {
 			tui.stop();
@@ -332,7 +376,105 @@ async function attachFromPi(source: SessionSource, ctx: Ctx, id: string): Promis
 			});
 		return { render: () => [], invalidate: () => {} };
 	});
-	if (ended) ctx.ui.notify(ended.text, ended.type);
+	return ended;
+}
+
+/**
+ * Plain pi as a pure client (spec §5.2): attach, then the manager, until the user closes the
+ * manager. Then pi ends. Its own session never gets a message.
+ */
+async function runClientLoop(self: Instance, ctx: ExtensionContext, first?: string, why?: string): Promise<void> {
+	if (self.clientLoop) return;
+	self.clientLoop = true;
+	let next = first;
+	let notice: Notice;
+	try {
+		for (;;) {
+			if (next) notice = await attachParked(self.source, ctx, next);
+			// The first notice also says why this pi attached on its own.
+			if (why && notice) notice = { ...notice, text: `${why} ${notice.text}` };
+			why = undefined;
+			const result = await showManager(self, ctx, { notice, full: true });
+			if (!result) break;
+			next = result.id;
+		}
+	} finally {
+		self.clientLoop = false;
+	}
+	ctx.shutdown();
+}
+
+/**
+ * At startup, plain pi either opens the manager (startDetached), or attaches when it opened
+ * the session file of a listed session (spec Q6). Two processes on one file fork the
+ * conversation, so pi must not keep that file for itself.
+ */
+function routeAtStart(self: Instance, reason: string, ctx: ExtensionContext): void {
+	if (reason !== "startup" && reason !== "resume") return;
+	let file: string | undefined;
+	try {
+		file = ctx.sessionManager.getSessionFile();
+	} catch (error) {
+		debug(error);
+	}
+	const paths = statePaths(getAgentDir());
+	const listed = file && existsSync(file) ? new Registry(paths.sessions).load().find((r) => r.sessionFile === file) : undefined;
+	const detached = reason === "startup" && readManagerSettings(path.join(getAgentDir(), "settings.json")).startDetached;
+	if (!listed && !detached) return;
+	const why = listed ? `"${listed.name ?? listed.firstPrompt ?? listed.id}" runs in the background, so pi attached to it.` : undefined;
+	// The TUI starts after session_start. The client loop needs it.
+	setTimeout(() => {
+		runClientLoop(self, ctx, listed?.id, why).catch((error) => {
+			debug(error);
+			ctx.ui.notify(String(error?.message ?? error), "error");
+		});
+	}, 0);
+}
+
+/**
+ * /sessions bg: plain pi hands its session to a worker (spec §13). pi starts a new empty
+ * session first, so it never writes to the file again. Then a worker opens the file, and
+ * this terminal attaches to it.
+ */
+async function backgroundCommand(self: Instance, ctx: ExtensionCommandContext): Promise<void> {
+	if (workerBridge()) {
+		ctx.ui.notify("This session already runs in the background. Use /sessions detach to leave it.", "info");
+		return;
+	}
+	if (!ctx.isIdle()) {
+		ctx.ui.notify("Wait for the run to end, or press esc, then move the session.", "warning");
+		return;
+	}
+	// Plain data only: the context goes stale with the session switch.
+	const file = ctx.sessionManager.getSessionFile();
+	const cwd = ctx.cwd || process.cwd();
+	const inherit = inheritFrom(ctx);
+	const name = ctx.sessionManager.getSessionName?.();
+	const source = self.source;
+	await source.ensureConnected();
+	if (!file || !existsSync(file)) {
+		// pi writes no file before the first message. There is nothing to move, so start fresh.
+		const row = await source.create({ cwd, name, ...inherit });
+		await attachFromPi(source, ctx, row.id);
+		return;
+	}
+	let fresh: ExtensionCommandContext | undefined;
+	const { cancelled } = await ctx.newSession({
+		withSession: async (next) => {
+			fresh = next;
+		},
+	});
+	if (cancelled || !fresh) {
+		ctx.ui.notify("The session stays here. Another extension cancelled the switch.", "warning");
+		return;
+	}
+	const target: ExtensionCommandContext = fresh;
+	try {
+		const row = await source.create({ cwd, sessionFile: file, ...inherit });
+		await attachFromPi(source, target, row.id);
+	} catch (error: any) {
+		target.ui.notify(`The session did not move: ${error?.message ?? error}. Its file stays. /resume opens it here.`, "error");
+	}
 }
 
 function statusReport(source: SessionSource): string {
@@ -445,6 +587,8 @@ const SUBCOMMAND_HANDLERS: Record<string, SubcommandHandler> = {
 	stop: stopCommand,
 	kill: stopCommand,
 	resume: (self, ctx) => openManager(self, ctx, "resume"),
+	bg: backgroundCommand,
+	background: backgroundCommand,
 	detach: detachCommand,
 };
 

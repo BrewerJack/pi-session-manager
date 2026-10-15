@@ -1,7 +1,7 @@
 // End to end: a real supervisor and real pi workers in a throwaway agent dir (spec §12).
 // The tests skip when no pi is on PATH. No test sends a message, so no model runs.
 import assert from "node:assert/strict";
-import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -165,7 +165,9 @@ test("/sessions detach leaves the session running", { skip }, async () => {
 });
 
 test("a worker reports its conversation and answers transcript, stats, and rename", { skip }, async () => {
-	const file = path.join(agentDir, "conversation.jsonl");
+	// pi moves *.jsonl files out of the root of the agent dir. Keep the file in a folder.
+	const file = path.join(agentDir, "work", "conversation.jsonl");
+	mkdirSync(path.dirname(file), { recursive: true });
 	copyFileSync(path.join(ROOT, "test", "fixtures", "conversation.jsonl"), file);
 	const record = await create("ignored", { sessionFile: file });
 	// The file names the session. The worker keeps that name.

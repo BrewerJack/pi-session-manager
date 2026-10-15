@@ -45,6 +45,7 @@
 		"session-file.ts",
 		"transcript.ts",
 		"manager-app.ts",
+		"settings.ts",
 		"README.md",
 		"LICENSE"
 	],

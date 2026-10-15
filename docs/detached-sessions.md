@@ -95,6 +95,8 @@ This design copies its model:
 The setting `sessionManager.startDetached: true` makes plain `pi` act like `pi-sm`.
 On startup, the extension hands the terminal to the manager at once.
 The plain session stays parked and never appears. This setting makes the main session invisible.
+`PI_SESSION_MANAGER_START_DETACHED=1` or `=0` overrides the setting for one start.
+Closing the manager ends pi. A `pi -c` or `pi --resume` start opens the session in plain pi as before.
 
 ## 6. Files on disk
 
@@ -469,7 +471,7 @@ The plain pi process then attaches to that worker.
 | Q3 | Does any pi code write to `process.stdout` outside the `Terminal`? | Answered (§8.4). |
 | Q4 | Do extensions with a global state break when each session gets its own process? This mostly helps them. | Answered in M2: no. A worker with the agent dir of the user loads all extensions. pi-lens, context-mode, and an extension model provider work in it. |
 | Q5 | Should the record keep the full client `env`, or only an allow list? It may hold secrets. | Answered: an allow list with user additions (§6.3). |
-| Q6 | Does a second pi process that opens a session file of a live worker corrupt it? | Answered in M1: no byte damage, but the conversation forks. Each process appends its own entries and never sees the other's. `create` returns the listed session for a known file. M4 routes `--resume` of a live session to attach, as Claude Code does. |
+| Q6 | Does a second pi process that opens a session file of a live worker corrupt it? | Answered in M1: no byte damage, but the conversation forks. Each process appends its own entries and never sees the other's. `create` returns the listed session for a known file. M4 routes `--resume` of a listed session to attach, as Claude Code does. Plain pi then ends when the user closes the manager. Extensions that append an entry on `session_start` still write once to the file. That entry hangs off the leaf at that time, so no conversation gets lost. |
 | Q7 | Can the client run the external editor (`ctrl+g`) for a worker and send the text back? | After M7. |
 | Q8 | pi-tui detects terminal capabilities, such as images, from the environment at startup. A worker keeps the values of the terminal that started it. Should `hello` override them for each client? | Before M3. `hello` already carries `term`, `colorterm`, and `termProgram`. |
 | Q9 | `SocketTerminal` skips the OSC 7501 program status. Is it needed? | After M7. |
@@ -612,4 +614,25 @@ socket was unref'd, so nothing held the event loop. `RemoteSource` now refs the 
 Tests: `test/remote-source.test.ts` runs the client side against a supervisor with fake workers.
 `test/session-file.test.ts` and `test/ui.test.ts` cover the file reader and the views.
 `test/e2e.test.ts` adds a worker that answers transcript, stats, and rename, and the `switch` from the overlay of a worker.
+
+### M4: done on 2026-10-15
+
+M4 makes plain pi a full client:
+
+- `/sessions bg` hands a plain session to a worker. pi starts a new empty session first, so it never writes to the old file again.
+  Then a worker opens the file, and the terminal attaches to it. After a detach, plain pi shows its new empty session.
+  A plain session without messages has no file. `/sessions bg` then starts a new background session in the same folder.
+  The command waits for an idle session.
+- `startDetached` runs a client loop in plain pi: the manager covers the screen, ⏎ attaches, and a detach returns to the manager.
+  Closing the manager ends pi.
+- Plain pi that opens the file of a listed session attaches to that session and runs the same client loop.
+  It finds the session in the records on disk, so this works before a supervisor runs. This covers `pi --session`,
+  `pi --resume`, and `/resume` inside plain pi.
+- `settings.ts` reads `startDetached`, and `idleMinutes` for M6.
+
+`test/plain-pi.test.ts` runs plain pi under a PTY from util-linux `script`. It covers `/sessions bg`, the route of a listed file, and `startDetached`.
+It skips without pi or `script`.
+
+Lesson: pi moves `*.jsonl` files out of the root of the agent dir at startup, as a migration of old session files.
+Tests keep their session files in another folder.
 
