@@ -261,8 +261,8 @@ The supervisor removes the record. The session file stays.
 
 | Event | Result |
 | --- | --- |
-| A worker stays `idle` and unattached for `idleMinutes` (default 60) | The supervisor stops the worker. The record becomes `saved`. Pinned sessions stay. |
-| A worker exits with code ≠ 0 while `working` | The supervisor restarts it from the session file once. A second crash within 10 minutes makes it `failed`. |
+| A worker stays `idle` and unattached for `idleMinutes` (default 60) | The supervisor stops the worker. The record becomes `saved`. Pinned sessions stay. `sessionManager.idleMinutes` sets the time. `0` turns it off. |
+| A worker exits with code ≠ 0 while `working` | The supervisor restarts it from the session file once. The record says that the run stopped. A second crash within 10 minutes makes it `failed`. A worker of an earlier supervisor counts as crashed when it dies during a run, because its exit code is unknown. |
 | A worker exits with code ≠ 0 while `idle` | The record becomes `saved`. |
 | A worker ends before the first message | The supervisor removes the record. pi wrote no session file, so nothing can come back. |
 | The supervisor dies | Each worker keeps running. It retries the supervisor socket every 2 seconds for 60 seconds, then exits. |
@@ -653,4 +653,26 @@ M5 moves the path locks into the supervisor (§9):
 
 `test/supervisor-locks.test.ts` is the lock test of §12: two workers write one path, and the second write is blocked
 until the first releases it. It also covers the release on a closed connection and a lock of plain pi.
+
+### M6: done on 2026-10-15
+
+M6 completes §7.6 and the version restart of §7.1:
+
+- Idle reaping: the sweep stops the worker of an `idle` session without a client after `sessionManager.idleMinutes`.
+  The supervisor reads the setting on each sweep, so a change applies at once. `p` in the manager pins a session.
+- Crash restart: a worker that dies during a run starts again once from its file, without a message.
+  The record keeps `lastOutcome: "error"` and an error that says the run stopped. A second crash within 10 minutes makes the session `failed`.
+- The exit handler of a child settles its record, because only it knows the exit code. A closed connection
+  settles only workers of an earlier supervisor.
+- A supervisor that closed with `keepWorkers` ignores the exits of its old children. Before this, it restarted a
+  crashed worker after it had handed the sessions to the next supervisor.
+- Version restart: a client with a newer version stops an older supervisor with `keepWorkers`, waits for its socket
+  to go away, and starts its own. Versions that are not numbers, as in tests, never count as older.
+- The client passes `PI_CODING_AGENT_DIR` of its paths to a new supervisor, so the supervisor serves the agent dir that the client asked for.
+
+Tests:
+
+- `test/supervisor.test.ts`: crash restart and the second crash, idle reaping with a client and a pin, the reboot cases,
+  and recovery after a SIGKILL of a supervisor in its own process (`test/fixtures/supervisor-process.ts`).
+- `test/e2e.test.ts`: a newer client restarts an older supervisor, and its worker reconnects. Idle reaping with real workers.
 

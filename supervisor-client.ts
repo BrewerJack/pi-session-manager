@@ -17,18 +17,61 @@ export interface SupervisorHandle {
 	pid: number;
 }
 
+/**
+ * Connect to the supervisor of an agent dir. `start` starts one when none runs. A supervisor
+ * with an older version than this client restarts as this version, and keeps its workers (spec §7.1).
+ */
 export async function connectSupervisor(
 	paths: StatePaths,
 	context: BootContext,
 	options: { start?: boolean } = {},
 ): Promise<SupervisorHandle> {
+	const start = options.start !== false;
 	let connection = await tryConnect(paths.supervisorSocket);
 	if (!connection) {
-		if (options.start === false) throw new Error("The supervisor does not run.");
+		if (!start) throw new Error("The supervisor does not run.");
 		connection = await startSupervisor(paths, context);
 	}
-	const hello = await connection.request<{ version: string; pid: number }>({ type: "hello", version: context.version });
+	let hello = await connection.request<{ version: string; pid: number }>({ type: "hello", version: context.version });
+	if (start && isOlder(hello.version, context.version)) {
+		await connection.request({ type: "shutdown", keepWorkers: true }, 30_000).catch(() => {});
+		connection.close();
+		await waitUntilGone(paths.supervisorSocket);
+		connection = await startSupervisor(paths, context);
+		hello = await connection.request<{ version: string; pid: number }>({ type: "hello", version: context.version });
+	}
 	return { connection, version: hello.version, pid: hello.pid };
+}
+
+/** Numeric parts of a version such as 0.4.0, or undefined for other strings. */
+function versionParts(version: string): number[] | undefined {
+	const match = /^(\d+)\.(\d+)\.(\d+)/.exec(version.trim());
+	return match ? match.slice(1).map(Number) : undefined;
+}
+
+/** True when `a` is an older version than `b`. Versions that are no numbers never count as older. */
+export function isOlder(a: string, b: string): boolean {
+	const left = versionParts(a);
+	const right = versionParts(b);
+	if (!left || !right) return false;
+	for (let i = 0; i < 3; i++) {
+		const x = left[i] ?? 0;
+		const y = right[i] ?? 0;
+		if (x !== y) return x < y;
+	}
+	return false;
+}
+
+/** The old supervisor removes its socket when it closes. */
+async function waitUntilGone(socketPath: string, timeoutMs = 15_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const connection = await tryConnect(socketPath);
+		if (!connection) return;
+		connection.socket.destroy();
+		await new Promise((resolve) => setTimeout(resolve, 100));
+	}
+	throw new Error("The old supervisor did not stop.");
 }
 
 async function tryConnect(socketPath: string): Promise<Connection | undefined> {
@@ -95,7 +138,8 @@ function spawnSupervisor(paths: StatePaths, context: BootContext): void {
 			cwd: homedir(),
 			detached: true,
 			stdio: ["ignore", fd, fd],
-			env: process.env,
+			// The supervisor serves the agent dir of these paths, whatever the env of this client says.
+			env: { ...process.env, PI_CODING_AGENT_DIR: paths.agentDir },
 		});
 		child.unref();
 	} finally {

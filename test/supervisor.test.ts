@@ -25,7 +25,7 @@ function tempDir(): string {
 }
 
 /** A supervisor whose workers are fake-worker.mjs. FAKE_STATE comes from the env of the create request. */
-async function startSupervisor(paths: StatePaths): Promise<Supervisor> {
+async function startSupervisor(paths: StatePaths, extra: { idleMs?: number } = {}): Promise<Supervisor> {
 	const supervisor = new Supervisor({
 		paths,
 		version: "test",
@@ -33,6 +33,7 @@ async function startSupervisor(paths: StatePaths): Promise<Supervisor> {
 		log: () => {},
 		sweepMs: 100,
 		createTimeoutMs: 5_000,
+		idleMs: extra.idleMs ?? 0,
 		spawnWorker: ({ record }: StartWorker) => {
 			const args = [FAKE_WORKER, paths.supervisorSocket, record.id];
 			if (record.sessionFile) args.push(record.sessionFile);
@@ -45,8 +46,8 @@ async function startSupervisor(paths: StatePaths): Promise<Supervisor> {
 	return supervisor;
 }
 
-function sessionFile(dir: string): string {
-	const file = path.join(dir, "session.jsonl");
+function sessionFile(dir: string, name = "session"): string {
+	const file = path.join(dir, `${name}.jsonl`);
 	writeFileSync(file, `${JSON.stringify({ type: "session", id: "x", cwd: dir })}\n`);
 	return file;
 }
@@ -119,15 +120,45 @@ test("a killed idle worker leaves a saved session, or none without a session fil
 	}
 });
 
-test("a killed working worker leaves a failed session with the reason", async () => {
+test("a worker that crashes during a run starts again once, then fails", async () => {
 	const dir = tempDir();
 	const supervisor = await startSupervisor(statePaths(dir));
 	try {
 		const record = await supervisor.create(request(dir, { sessionFile: sessionFile(dir), env: { FAKE_STATE: "working" } }));
 		assert.equal(record.state, "working");
-		process.kill(record.pid!, "SIGKILL");
+		const firstPid = record.pid!;
+		process.kill(firstPid, "SIGKILL");
+		await until(() => {
+			const now = supervisor.find(record.id);
+			return Boolean(now?.pid && now.pid !== firstPid && now.state === "working");
+		});
+		const restarted = supervisor.find(record.id)!;
+		assert.match(restarted.error ?? "", /SIGKILL.*started again/);
+		assert.equal(restarted.lastOutcome, "error");
+		process.kill(restarted.pid!, "SIGKILL");
 		await until(() => stateOf(supervisor, record.id) === "failed");
-		assert.match(supervisor.find(record.id)?.error ?? "", /SIGKILL/);
+		assert.match(supervisor.find(record.id)?.error ?? "", /crashed twice/);
+	} finally {
+		await supervisor.close(false);
+	}
+});
+
+test("an idle session without a client loses its worker, unless a client holds it or it is pinned", async () => {
+	const dir = tempDir();
+	const paths = statePaths(dir);
+	const supervisor = await startSupervisor(paths, { idleMs: 300 });
+	try {
+		const idle = await supervisor.create(request(dir, { sessionFile: sessionFile(dir) }));
+		const held = await supervisor.create(request(dir, { sessionFile: sessionFile(dir, "held"), env: { FAKE_ATTACHED: "1" } }));
+		const pinned = await supervisor.create(request(dir, { sessionFile: sessionFile(dir, "pinned") }));
+		const blank = await supervisor.create(request(dir));
+		const client = await connect(paths.supervisorSocket);
+		await client.request({ type: "pin", session: pinned.id, pinned: true });
+		await until(() => stateOf(supervisor, idle.id) === "saved" && !stateOf(supervisor, blank.id), 3_000);
+		assert.equal(isAlive(idle.pid!), false);
+		assert.equal(stateOf(supervisor, held.id), "idle");
+		assert.equal(stateOf(supervisor, pinned.id), "idle");
+		client.close();
 	} finally {
 		await supervisor.close(false);
 	}
@@ -224,4 +255,49 @@ test("close does not wait for clients that stay connected", async () => {
 	await supervisor.close(false);
 	assert.ok(Date.now() - started < 2_000);
 	await until(() => client.isClosed);
+});
+
+test("workers reconnect to a new supervisor after the old one dies from SIGKILL", async () => {
+	const dir = tempDir();
+	const paths = statePaths(dir);
+	const fixture = path.join(path.dirname(FAKE_WORKER), "supervisor-process.ts");
+	const old = spawn(process.execPath, [fixture, dir], { stdio: ["ignore", "pipe", "inherit"] });
+	await new Promise<void>((resolve, reject) => {
+		old.stdout.on("data", (chunk: Buffer) => chunk.toString().includes("ready") && resolve());
+		old.once("exit", (code) => reject(new Error(`the supervisor process exited with ${code}`)));
+	});
+	const client = await connect(paths.supervisorSocket);
+	const { record } = await client.request<{ record: SessionRecord }>({ type: "create", request: request(dir, { sessionFile: sessionFile(dir) }) });
+	pids.push(record.pid!);
+	client.close();
+	old.kill("SIGKILL");
+	await until(() => old.exitCode !== null || old.signalCode !== null);
+	assert.ok(isAlive(record.pid!));
+	// The socket file of the dead supervisor stays behind. The new one replaces it.
+	const next = await startSupervisor(paths);
+	try {
+		await until(() => Boolean((next as any).live.get(record.id)?.connection));
+		assert.equal(next.find(record.id)?.pid, record.pid);
+		assert.equal(stateOf(next, record.id), "idle");
+	} finally {
+		await next.close(false);
+	}
+	assert.equal(isAlive(record.pid!), false);
+});
+
+test("after a reboot, a dead idle worker leaves a saved session", async () => {
+	const dir = tempDir();
+	const paths = statePaths(dir);
+	const first = await startSupervisor(paths);
+	const record = await first.create(request(dir, { sessionFile: sessionFile(dir) }));
+	await first.close(true);
+	process.kill(record.pid!, "SIGKILL");
+	await until(() => !isAlive(record.pid!));
+	const second = await startSupervisor(paths);
+	try {
+		assert.equal(stateOf(second, record.id), "saved");
+		assert.equal(second.find(record.id)?.error, undefined);
+	} finally {
+		await second.close(false);
+	}
 });

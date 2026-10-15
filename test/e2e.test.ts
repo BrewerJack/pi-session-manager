@@ -1,9 +1,10 @@
 // End to end: a real supervisor and real pi workers in a throwaway agent dir (spec §12).
 // The tests skip when no pi is on PATH. No test sends a message, so no model runs.
 import assert from "node:assert/strict";
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { PassThrough } from "node:stream";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -13,7 +14,7 @@ import { attach, type AttachResult } from "../client.ts";
 import type { SessionRecord } from "../control.ts";
 import { statePaths, type StatePaths } from "../paths.ts";
 import { nameOf, readSessionFile } from "../session-file.ts";
-import { isAlive } from "../supervisor.ts";
+import { isAlive, Supervisor, type StartWorker } from "../supervisor.ts";
 import { connectSupervisor, type SupervisorHandle } from "../supervisor-client.ts";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -81,9 +82,9 @@ function client(socket: string) {
 	};
 }
 
-async function until(check: () => boolean, what: string, ms = 15_000): Promise<void> {
+async function until(check: () => boolean | Promise<boolean>, what: string, ms = 15_000): Promise<void> {
 	const deadline = Date.now() + ms;
-	while (!check()) {
+	while (!(await check())) {
 		if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
 		await new Promise((resolve) => setTimeout(resolve, 50));
 	}
@@ -200,4 +201,67 @@ test("the manager in a worker sends its client to another session", { skip }, as
 	viewer.type("\r");
 	assert.deepEqual(await viewer.done, { kind: "switch", id: first.id });
 	assert.ok(isAlive(there.pid!));
+});
+
+test("a newer client restarts an older supervisor and keeps its workers", { skip }, async () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "pism-upgrade-"));
+	const otherPaths = statePaths(dir);
+	const fakeWorker = path.join(ROOT, "test", "fixtures", "fake-worker.mjs");
+	const old = new Supervisor({
+		paths: otherPaths,
+		version: "0.0.1",
+		bootFile: "unused",
+		log: () => {},
+		idleMs: 0,
+		spawnWorker: ({ record }: StartWorker) => {
+			const args = [fakeWorker, otherPaths.supervisorSocket, record.id, record.sessionFile ?? ""].filter(Boolean);
+			const child = spawn(process.execPath, args, { stdio: "ignore", detached: true });
+			child.unref();
+			return child;
+		},
+	});
+	assert.equal(await old.start(), true);
+	const file = path.join(dir, "work.jsonl");
+	writeFileSync(file, `${JSON.stringify({ type: "session", id: "x", cwd: dir })}\n`);
+	const record = await old.create({ cwd: dir, env: {}, piDir: piDir!, sessionFile: file });
+	const version = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8")).version;
+	const next = await connectSupervisor(otherPaths, { piDir: piDir!, root: ROOT, version });
+	try {
+		assert.equal(next.version, version);
+		assert.notEqual(next.pid, process.pid);
+		assert.ok(isAlive(record.pid!));
+		await until(async () => {
+			const { sessions } = await next.connection.request<{ sessions: SessionRecord[] }>({ type: "list" });
+			return sessions.some((r) => r.id === record.id && r.pid === record.pid && r.state === "idle");
+		}, "the worker on the new supervisor");
+	} finally {
+		await next.connection.request({ type: "shutdown", keepWorkers: false }, 30_000).catch(() => {});
+		next.connection.close();
+		await until(() => !isAlive(record.pid!), "the end of the worker");
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+// This test must stay the last one: it lets the supervisor stop every idle session without a client.
+test("an idle session without a client loses its worker, and an attached one keeps it", { skip }, async () => {
+	const settings = path.join(agentDir, "settings.json");
+	const before = readFileSync(settings, "utf8");
+	const watched = await create("watched");
+	const viewer = client(await socketOf(watched.id));
+	await until(() => viewer.screen().includes("watched"), "the screen");
+	const sleepy = await create("sleepy");
+	// About a second. The supervisor reads the setting on each sweep, every 5 seconds.
+	writeFileSync(settings, JSON.stringify({ ...JSON.parse(before), sessionManager: { idleMinutes: 0.02 } }));
+	try {
+		await until(async () => {
+			const { sessions } = await handle.connection.request<{ sessions: SessionRecord[] }>({ type: "list" });
+			return !sessions.some((r) => r.id === sleepy.id);
+		}, "the idle stop", 20_000);
+		assert.equal(isAlive(sleepy.pid!), false);
+		assert.ok(isAlive(watched.pid!));
+		viewer.type("\x04");
+		assert.equal((await viewer.done).kind, "detached");
+	} finally {
+		writeFileSync(settings, before);
+	}
 });

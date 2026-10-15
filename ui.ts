@@ -447,6 +447,15 @@ export class ManagerView implements Component, Focusable {
 		});
 	}
 
+	/** A pinned session keeps its worker when it idles (spec §7.6). */
+	private togglePin(r: Row | undefined): void {
+		if (!r) return;
+		void this.run("Pin", async () => {
+			await this.source.pin(r.id, !r.pinned);
+			this.say(r.pinned ? `"${titleOf(r)}" can stop when idle` : `"${titleOf(r)}" keeps running when idle`);
+		});
+	}
+
 	private requestKill(r: Row | undefined): void {
 		if (!r) return;
 		this.confirmKillId = r.id;
@@ -578,6 +587,9 @@ export class ManagerView implements Component, Focusable {
 				return true;
 			case "x":
 				this.interrupt(r);
+				return true;
+			case "p":
+				this.togglePin(r);
 				return true;
 			case "k":
 			case "d":
@@ -775,6 +787,7 @@ export class ManagerView implements Component, Focusable {
 					["e", "rename"],
 					["x", "interrupt"],
 					["k", "stop"],
+					["p", "pin"],
 					["o", "new in folder"],
 					["r", "resume"],
 					["/", "filter"],

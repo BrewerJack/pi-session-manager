@@ -7,7 +7,7 @@ import { attachLoop, describeEnd } from "./client.ts";
 import type { CreateRequest, SessionRecord } from "./control.ts";
 import { loadEnvAllow, pickEnv } from "./env.ts";
 import { agentDirFrom, statePaths, type BootContext, type StatePaths } from "./paths.ts";
-import { connectSupervisor, type SupervisorHandle } from "./supervisor-client.ts";
+import { connectSupervisor, isOlder, type SupervisorHandle } from "./supervisor-client.ts";
 
 const USAGE = `usage: pi-sm [command]
 
@@ -59,11 +59,9 @@ export async function main(context: BootContext, argv: string[]): Promise<number
 
 async function open(context: BootContext, paths: StatePaths, start = true): Promise<SupervisorHandle> {
 	const handle = await connectSupervisor(paths, context, { start });
-	if (handle.version !== context.version) {
-		process.stderr.write(
-			`pi-sm: the supervisor runs ${handle.version}, this client is ${context.version}. ` +
-				`Run "pi-sm daemon stop --keep-workers" to restart it.\n`,
-		);
+	// An older supervisor restarts on connect. A newer one stays, and this client may lack its features.
+	if (isOlder(context.version, handle.version)) {
+		process.stderr.write(`pi-sm: the supervisor runs ${handle.version}, this client is ${context.version}.\n`);
 	}
 	return handle;
 }

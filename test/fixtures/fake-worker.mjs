@@ -2,6 +2,7 @@
 // Usage: node fake-worker.mjs <supervisor socket> <id> [session file]
 // FAKE_STATE sets the reported state. The worker reconnects every 100 ms after a loss.
 // It answers send and rename with an update, as a real worker does, and transcript with one item.
+// FAKE_ATTACHED reports a client that holds the session.
 import net from "node:net";
 
 const [socketPath, id, sessionFile] = process.argv.slice(2);
@@ -12,7 +13,7 @@ function connect() {
 	const socket = net.connect(socketPath);
 	let buffer = "";
 	socket.on("connect", () => {
-		const update = { state, ...(sessionFile ? { sessionFile } : {}) };
+		const update = { state, ...(sessionFile ? { sessionFile } : {}), ...(process.env.FAKE_ATTACHED ? { attached: true } : {}) };
 		socket.write(`${JSON.stringify({ type: "worker.hello", id: nextId++, workerId: id, pid: process.pid, update })}\n`);
 	});
 	socket.on("data", (chunk) => {

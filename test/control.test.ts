@@ -100,3 +100,13 @@ test("socket paths stay short enough for macOS, also under a deep agent dir", ()
 	assert.notEqual(statePaths(`${deep}2`, { XDG_RUNTIME_DIR: "/run/user/1000" }).sockets, paths.sockets);
 	assert.equal(statePaths("/home/u/.pi/agent").sockets, "/home/u/.pi/agent/pi-session-manager/workers");
 });
+
+test("only a numeric older version counts as older", async () => {
+	const { isOlder } = await import("../supervisor-client.ts");
+	assert.equal(isOlder("0.3.0", "0.4.0"), true);
+	assert.equal(isOlder("0.4.0", "0.4.0"), false);
+	assert.equal(isOlder("0.10.0", "0.9.9"), false);
+	assert.equal(isOlder("1.0.0", "0.9.0"), false);
+	assert.equal(isOlder("test", "0.4.0"), false);
+	assert.equal(isOlder("0.4.0", "e2e"), false);
+});

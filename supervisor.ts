@@ -31,12 +31,15 @@ import {
 	type StatePaths,
 } from "./paths.ts";
 import { Registry } from "./registry.ts";
+import { readManagerSettings } from "./settings.ts";
 import { appendSessionName, branchOf, nameOf, readSessionFile } from "./session-file.ts";
 import { firstUserText, lastExchange, oneLine, transcriptOf, usageOf } from "./transcript.ts";
 
 const CREATE_TIMEOUT_MS = 90_000;
 const STOP_TIMEOUT_MS = 10_000;
 const SWEEP_MS = 5_000;
+/** A second crash within this time makes a session failed instead of starting it again (spec §7.6). */
+const CRASH_WINDOW_MS = 10 * 60_000;
 
 export interface SupervisorPidFile {
 	pid: number;
@@ -64,6 +67,14 @@ export interface SupervisorOptions {
 	sweepMs?: number;
 	/** Runs after a "shutdown" request closed the supervisor. */
 	onShutdown?: () => void;
+	/** Tests set the idle time. Otherwise sessionManager.idleMinutes of the settings decides. */
+	idleMs?: number;
+}
+
+/** How a worker ended. `restart` marks an end that the supervisor did not ask for. */
+interface Ended {
+	error?: string;
+	restart?: boolean;
 }
 
 interface Live {
@@ -89,8 +100,12 @@ export class Supervisor {
 	/** Names of clients that hold locks, such as a plain pi session. */
 	private readonly lockLabels = new Map<string, string>();
 	private nextClient = 1;
+	/** When the supervisor last started a crashed worker again, per session. */
+	private readonly restartedAt = new Map<string, number>();
 	private server?: net.Server;
 	private sweepTimer?: ReturnType<typeof setInterval>;
+	/** After close(), workers belong to the next supervisor. Their exits are not this one's business. */
+	private closed = false;
 
 	constructor(options: SupervisorOptions) {
 		this.options = options;
@@ -142,6 +157,7 @@ export class Supervisor {
 			const running = this.list().filter((r) => r.pid);
 			await Promise.all(running.map((r) => this.endWorker(r, "keep").catch((error) => this.log("end worker", error))));
 		}
+		this.closed = true;
 		if (this.sweepTimer) clearInterval(this.sweepTimer);
 		const closed = new Promise<void>((resolve) => (this.server ? this.server.close(() => resolve()) : resolve()));
 		for (const connection of this.connections) connection.close();
@@ -482,19 +498,20 @@ export class Supervisor {
 		} catch (error) {
 			clearTimeout(timer);
 			live.ready = undefined;
-			this.gone(record.id, `The worker did not spawn: ${String(error)}`);
+			this.gone(record.id, { error: `The worker did not spawn: ${String(error)}` });
 			return Promise.reject(error);
 		}
 		live.child = child;
 		record.pid = child.pid;
 		this.save(record);
 		child.once("exit", (code, signalName) => {
-			if (live.child !== child) return;
+			if (live.child !== child || this.closed) return;
 			live.child = undefined;
 			if (this.records.get(record.id)?.pid !== child.pid) return;
 			const how = signalName ? `signal ${signalName}` : `code ${code}`;
 			live.ready?.reject(new Error(`The worker exited with ${how}. See ${workerLog(this.paths, record.id)}`));
-			this.gone(record.id, code === 0 && !signalName ? undefined : `The worker exited with ${how}.`);
+			const clean = code === 0 && !signalName;
+			this.gone(record.id, clean ? {} : { error: `The worker exited with ${how}.`, restart: true });
 		});
 		return ready.finally(() => {
 			clearTimeout(timer);
@@ -532,15 +549,21 @@ export class Supervisor {
 	}
 
 	private workerDisconnected(id: string, connection: Connection): void {
+		if (this.closed) return;
 		const live = this.live.get(id);
 		if (live?.connection !== connection) return;
 		live.connection = undefined;
+		// The exit handler of a child knows its exit code. It settles the record.
+		if (live.child) return;
 		const pid = this.records.get(id)?.pid;
-		if (!pid || !isAlive(pid)) this.gone(id);
+		if (!pid || !isAlive(pid)) this.gone(id, { error: "The worker ended.", restart: true });
 		// A live worker without a connection reconnects, or the sweep notices its exit.
 	}
 
-	/** Records that name a process: keep live ones for reconnect, settle dead ones (spec §7.6). */
+	/**
+	 * Records that name a process: keep live ones for reconnect, settle dead ones (spec §7.6).
+	 * Dead ones come from a reboot or a crash while no supervisor ran. Nothing starts again.
+	 */
 	private reconcile(): void {
 		for (const record of this.records.values()) {
 			if (record.pid && isAlive(record.pid)) continue;
@@ -550,13 +573,40 @@ export class Supervisor {
 
 	private sweep(): void {
 		for (const record of this.records.values()) {
-			if (!record.pid || this.live.get(record.id)?.connection) continue;
-			if (!isAlive(record.pid)) this.gone(record.id);
+			const live = this.live.get(record.id);
+			if (!record.pid || live?.connection || live?.child) continue;
+			if (!isAlive(record.pid)) this.gone(record.id, { error: "The worker ended.", restart: true });
+		}
+		this.reapIdle();
+	}
+
+	/** Minutes from the settings, read on each sweep, so a change applies without a restart. */
+	private idleMs(): number {
+		if (this.options.idleMs !== undefined) return this.options.idleMs;
+		return readManagerSettings(path.join(this.paths.agentDir, "settings.json")).idleMinutes * 60_000;
+	}
+
+	/** An idle session without a client loses its worker. Its record becomes saved (spec §7.6). */
+	private reapIdle(): void {
+		const idleMs = this.idleMs();
+		if (idleMs <= 0) return;
+		const now = Date.now();
+		for (const record of this.records.values()) {
+			const live = this.live.get(record.id);
+			if (!live?.connection || live.ending || live.ready) continue;
+			if (record.state !== "idle" || record.attached || record.pinned) continue;
+			if (now - record.lastActivityAt < idleMs) continue;
+			this.log(`session ${record.id} idle for ${Math.round((now - record.lastActivityAt) / 60_000)} min. Its worker stops.`);
+			void this.endWorker(record, "keep").catch((error) => this.log("idle stop", error));
 		}
 	}
 
-	/** The worker process ended. A requested stop forgets the session. Otherwise it becomes saved or failed. */
-	private gone(id: string, error?: string): void {
+	/**
+	 * The worker process ended. A requested stop forgets the session. A crash during a run starts
+	 * the worker again once. Otherwise the session becomes saved or failed (spec §7.6).
+	 */
+	private gone(id: string, ended: Ended = {}): void {
+		const { error } = ended;
 		const record = this.records.get(id);
 		if (!record) return;
 		this.releaseLocks(id);
@@ -575,15 +625,45 @@ export class Supervisor {
 			return;
 		}
 		const busy = record.state === "working" || record.state === "waiting" || record.state === "starting";
+		let failure = error;
+		if (busy && ended.restart && !live?.ending) {
+			if (this.restartAfterCrash(record, error ?? "The worker ended.")) return;
+			failure = `${error ?? "The worker ended."} It crashed twice in 10 minutes.`;
+		}
 		// An idle session lost nothing. A busy one lost its run (spec §7.6).
 		record.state = busy ? "failed" : "saved";
-		if (busy && error) record.error = error;
+		if (busy && failure) record.error = failure;
 		record.pid = undefined;
 		for (const key of TRANSIENT_FIELDS) delete record[key];
 		record.runStartedAt = undefined;
 		record.promptTitle = undefined;
 		this.save(record);
 		this.log(`worker ${id} ended, session is ${record.state}${error ? `: ${error}` : ""}`);
+	}
+
+	/**
+	 * Start a crashed worker again from its session file. The run does not continue, and no
+	 * message goes out, so no shell command runs twice. Returns false after a second crash.
+	 */
+	private restartAfterCrash(record: SessionRecord, error: string): boolean {
+		const now = Date.now();
+		const last = this.restartedAt.get(record.id);
+		if (last && now - last < CRASH_WINDOW_MS) {
+			this.log(`worker ${record.id} crashed again: ${error}`);
+			return false;
+		}
+		this.restartedAt.set(record.id, now);
+		for (const key of TRANSIENT_FIELDS) delete record[key];
+		record.state = "starting";
+		record.pid = undefined;
+		record.runStartedAt = undefined;
+		record.promptTitle = undefined;
+		record.lastOutcome = "error";
+		record.error = `${error} The worker started again. The run stopped.`;
+		this.save(record);
+		this.log(`worker ${record.id} crashed during a run: ${error} Starting it again.`);
+		this.launch({ record }).catch((launchError) => this.log(`restart of ${record.id} failed`, launchError));
+		return true;
 	}
 
 	private forget(id: string): void {
