@@ -1,7 +1,7 @@
 // Supervisor: one process per agent dir. It keeps the session records, starts and stops
 // workers, and answers clients (spec §5 and §7). It holds no session of its own.
 import { spawn, type ChildProcess } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, rmSync, statSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -9,7 +9,10 @@ import { parseArgs } from "node:util";
 import {
 	connect,
 	Connection,
+	publicRecord,
+	TRANSIENT_FIELDS,
 	type CreateRequest,
+	type Inheritance,
 	type Message,
 	type ReplyData,
 	type SessionRecord,
@@ -27,6 +30,8 @@ import {
 	type StatePaths,
 } from "./paths.ts";
 import { Registry } from "./registry.ts";
+import { appendSessionName, branchOf, nameOf, readSessionFile } from "./session-file.ts";
+import { firstUserText, lastExchange, oneLine, transcriptOf, usageOf } from "./transcript.ts";
 
 const CREATE_TIMEOUT_MS = 90_000;
 const STOP_TIMEOUT_MS = 10_000;
@@ -43,6 +48,7 @@ export interface StartWorker {
 	record: SessionRecord;
 	task?: string;
 	name?: string;
+	inherit?: Inheritance;
 }
 
 export interface SupervisorOptions {
@@ -75,6 +81,8 @@ export class Supervisor {
 	private readonly live = new Map<string, Live>();
 	/** Every open connection, so close() does not wait for clients that stay connected. */
 	private readonly connections = new Set<Connection>();
+	/** Clients that receive changed and removed events. */
+	private readonly subscribers = new Set<Connection>();
 	private server?: net.Server;
 	private sweepTimer?: ReturnType<typeof setInterval>;
 
@@ -166,26 +174,43 @@ export class Supervisor {
 				return this.workerHello(workerId, message, connection);
 			}
 			if (message.type === "worker.update" && workerId) return this.workerUpdate(workerId, message.update as WorkerUpdate);
-			return this.clientRequest(message);
+			return this.clientRequest(message, connection);
 		});
 		connection.socket.on("close", () => {
 			this.connections.delete(connection);
+			this.subscribers.delete(connection);
 			if (workerId) this.workerDisconnected(workerId, connection);
 		});
 	}
 
-	private clientRequest(message: Message): ReplyData | Promise<ReplyData> {
+	private clientRequest(message: Message, connection: Connection): ReplyData | Promise<ReplyData> {
+		const session = String(message.session ?? "");
 		switch (message.type) {
 			case "hello":
 				return { version: this.options.version, pid: process.pid };
 			case "list":
-				return { sessions: this.list() };
+				return { sessions: this.list().map(publicRecord) };
+			case "subscribe":
+				this.subscribers.add(connection);
+				return { sessions: this.list().map(publicRecord) };
+			case "send":
+				return this.send(session, String(message.text ?? "")).then(() => ({}));
+			case "interrupt":
+				return this.forward(this.mustFind(session), { type: "interrupt" });
+			case "rename":
+				return this.rename(session, String(message.name ?? "")).then(() => ({}));
+			case "pin":
+				return this.pin(session, message.pinned === true);
+			case "transcript":
+				return this.transcript(session, Number(message.max) || 120);
+			case "stats":
+				return this.stats(session);
 			case "create":
-				return this.create(message.request as CreateRequest).then((record) => ({ record }));
+				return this.create(message.request as CreateRequest).then((record) => ({ record: publicRecord(record) }));
 			case "stop":
-				return this.stop(String(message.session ?? "")).then(() => ({}));
+				return this.stop(session).then(() => ({}));
 			case "attach":
-				return this.attach(String(message.session ?? ""));
+				return this.attach(session);
 			case "shutdown":
 				setImmediate(() => {
 					void this.close(message.keepWorkers === true).then(() => this.options.onShutdown?.());
@@ -221,8 +246,98 @@ export class Supervisor {
 			piDir: request.piDir,
 		};
 		this.save(record);
-		await this.launch({ record, task: request.task, name: request.name });
+		const inherit: Inheritance = { model: request.model, thinkingLevel: request.thinkingLevel, tools: request.tools };
+		await this.launch({ record, task: request.task, name: request.name, inherit });
 		return this.records.get(record.id) ?? record;
+	}
+
+	private mustFind(idOrName: string): SessionRecord {
+		const record = this.find(idOrName);
+		if (!record) throw new Error(`No session matches "${idOrName}".`);
+		return record;
+	}
+
+	/** Pass a request to the worker of a live session. */
+	private async forward(record: SessionRecord, message: Message, timeoutMs = 10_000): Promise<ReplyData> {
+		const connection = this.live.get(record.id)?.connection;
+		if (!connection) throw new Error(`"${record.name ?? record.id}" has no running worker.`);
+		return (await connection.request(message, timeoutMs)) ?? {};
+	}
+
+	/** Send a user message. A saved session starts first. A busy one queues it (spec §10.1). */
+	async send(idOrName: string, text: string): Promise<void> {
+		if (!text.trim()) throw new Error("The message is empty.");
+		const record = this.mustFind(idOrName);
+		await this.wake(record);
+		await this.forward(record, { type: "send", text });
+	}
+
+	async rename(idOrName: string, name: string): Promise<void> {
+		const record = this.mustFind(idOrName);
+		const trimmed = name.trim();
+		if (!trimmed) throw new Error("The name is empty.");
+		if (this.live.get(record.id)?.connection) {
+			await this.forward(record, { type: "rename", name: trimmed });
+		} else if (record.sessionFile && existsSync(record.sessionFile)) {
+			appendSessionName(record.sessionFile, trimmed);
+		}
+		record.name = trimmed;
+		this.save(record);
+	}
+
+	private pin(idOrName: string, pinned: boolean): ReplyData {
+		const record = this.mustFind(idOrName);
+		record.pinned = pinned;
+		this.save(record);
+		return {};
+	}
+
+	/** The conversation of a session: from its worker, or from the file of a saved session. */
+	private async transcript(idOrName: string, max: number): Promise<ReplyData> {
+		const record = this.mustFind(idOrName);
+		if (this.live.get(record.id)?.connection) return this.forward(record, { type: "transcript", max });
+		if (!record.sessionFile || !existsSync(record.sessionFile)) return { items: [] };
+		return { items: transcriptOf(branchOf(readSessionFile(record.sessionFile).entries), max) };
+	}
+
+	private async stats(idOrName: string): Promise<ReplyData> {
+		const record = this.mustFind(idOrName);
+		if (this.live.get(record.id)?.connection) return this.forward(record, { type: "stats" });
+		if (!record.sessionFile || !existsSync(record.sessionFile)) return { usage: record.usage ?? null };
+		return { usage: { ...usageOf(readSessionFile(record.sessionFile).entries), contextPercent: record.usage?.contextPercent ?? null } };
+	}
+
+	/**
+	 * A saved session from a session file, without a worker (spec §11.1). A file that a
+	 * listed session uses returns that session.
+	 */
+	addSaved(file: string, piDir: string, env: Record<string, string> = {}): SessionRecord {
+		const existing = this.list().find((r) => r.sessionFile === file);
+		if (existing) return existing;
+		const { header, entries } = readSessionFile(file);
+		const cwd = header?.cwd && path.isAbsolute(header.cwd) ? header.cwd : homedir();
+		const now = Date.now();
+		const branch = branchOf(entries);
+		const { prompt, reply } = lastExchange(branch);
+		const record: SessionRecord = {
+			id: newSessionId(cwd, now),
+			cwd,
+			state: "saved",
+			sessionFile: file,
+			sessionId: header?.id,
+			name: nameOf(entries),
+			firstPrompt: firstUserText(entries),
+			pinned: false,
+			createdAt: now,
+			lastActivityAt: fileTime(file) ?? now,
+			env,
+			piDir,
+			usage: usageOf(entries),
+			lastPrompt: prompt,
+			lastReply: reply,
+		};
+		this.save(record);
+		return record;
 	}
 
 	/** Start a saved or failed session again. A live session needs nothing. */
@@ -345,9 +460,12 @@ export class Supervisor {
 	private workerUpdate(id: string, update: WorkerUpdate): ReplyData {
 		const record = this.records.get(id);
 		if (!record) return {};
-		this.merge(record, update ?? {});
+		const patch = update ?? {};
+		this.merge(record, patch);
 		record.lastActivityAt = Date.now();
-		this.save(record);
+		// Streaming text and tool changes come often. Only lasting fields reach the disk.
+		const lasting = Object.keys(patch).some((key) => !(TRANSIENT_FIELDS as readonly string[]).includes(key));
+		this.save(record, lasting);
 		return {};
 	}
 
@@ -398,6 +516,9 @@ export class Supervisor {
 		record.state = busy ? "failed" : "saved";
 		if (busy && error) record.error = error;
 		record.pid = undefined;
+		for (const key of TRANSIENT_FIELDS) delete record[key];
+		record.runStartedAt = undefined;
+		record.promptTitle = undefined;
 		this.save(record);
 		this.log(`worker ${id} ended, session is ${record.state}${error ? `: ${error}` : ""}`);
 	}
@@ -407,7 +528,13 @@ export class Supervisor {
 		this.live.delete(id);
 		this.registry.remove(id);
 		rmSync(workerSocket(this.paths, id), { force: true });
-		if (known) this.log(`session ${id} removed`);
+		if (!known) return;
+		this.log(`session ${id} removed`);
+		this.publish({ type: "removed", session: id });
+	}
+
+	private publish(message: Message): void {
+		for (const connection of this.subscribers) connection.send(message);
 	}
 
 	private merge(record: SessionRecord, update: WorkerUpdate): void {
@@ -417,10 +544,14 @@ export class Supervisor {
 		}
 	}
 
-	private save(record: SessionRecord): void {
+	private save(record: SessionRecord, toDisk = true): void {
 		this.records.set(record.id, record);
+		this.publish({ type: "changed", record: publicRecord(record) });
+		if (!toDisk) return;
+		const lasting: SessionRecord = { ...record };
+		for (const key of TRANSIENT_FIELDS) delete lasting[key];
 		try {
-			this.registry.write(record);
+			this.registry.write(lasting);
 		} catch (error) {
 			this.log(`record ${record.id} not saved`, error);
 		}
@@ -428,7 +559,7 @@ export class Supervisor {
 }
 
 /** The default worker spawn: boot.mjs in its own process group, output to the worker log. */
-export function spawnWorker({ record, task, name }: StartWorker, supervisor: Supervisor): ChildProcess {
+export function spawnWorker({ record, task, name, inherit }: StartWorker, supervisor: Supervisor): ChildProcess {
 	const { paths, bootFile } = supervisor.options;
 	const log = workerLog(paths, record.id);
 	const args = [bootFile, "worker", "--pi-dir", record.piDir, "--id", record.id];
@@ -437,6 +568,9 @@ export function spawnWorker({ record, task, name }: StartWorker, supervisor: Sup
 	if (record.sessionFile) args.push("--session", record.sessionFile);
 	if (task?.trim()) args.push("--task", task);
 	if (name?.trim()) args.push("--name", name.trim());
+	if (inherit?.model) args.push("--model", `${inherit.model.provider}/${inherit.model.id}`);
+	if (inherit?.thinkingLevel) args.push("--thinking", inherit.thinkingLevel);
+	if (inherit?.tools) args.push("--tools", inherit.tools.join(","));
 	const fd = openSync(log, "a", 0o600);
 	try {
 		const child = spawn(process.execPath, args, {
@@ -492,9 +626,14 @@ async function answers(socketPath: string): Promise<boolean> {
 	}
 }
 
-function oneLine(text: string, max = 200): string {
-	return text.replace(/\s+/g, " ").trim().slice(0, max);
+function fileTime(file: string): number | undefined {
+	try {
+		return statSync(file).mtimeMs;
+	} catch {
+		return undefined;
+	}
 }
+
 
 // ---------------------------------------------------------------------------
 // Entry point, called by boot.mjs

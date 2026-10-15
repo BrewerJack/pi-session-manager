@@ -14,7 +14,7 @@ import {
 	type Component,
 	type Focusable,
 } from "@earendil-works/pi-tui";
-import { debug } from "./host.ts";
+import { debug } from "./log.ts";
 
 export type SavedSessionInfo = {
 	path: string;
@@ -464,12 +464,21 @@ export class ResumeSessionPicker implements Component, Focusable {
 	private error: string | null = null;
 	private readonly filterInput = new Input();
 
+	private readonly theme: any;
+	private readonly loadSessions: () => Promise<SavedSessionInfo[]>;
+	private readonly onDone: (sessionPath: string | null) => void;
+	private readonly requestRender: () => void;
+
 	constructor(
-		private readonly theme: any,
-		private readonly loadSessions: () => Promise<SavedSessionInfo[]>,
-		private readonly onDone: (sessionPath: string | null) => void,
-		private readonly requestRender: () => void,
+		theme: any,
+		loadSessions: () => Promise<SavedSessionInfo[]>,
+		onDone: (sessionPath: string | null) => void,
+		requestRender: () => void,
 	) {
+		this.theme = theme;
+		this.loadSessions = loadSessions;
+		this.onDone = onDone;
+		this.requestRender = requestRender;
 		this.filterInput.focused = true;
 		void this.refresh();
 	}

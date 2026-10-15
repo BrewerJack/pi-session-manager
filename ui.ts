@@ -1,5 +1,6 @@
-// Session manager UI: a Claude-Code-style overlay that lists live sessions with
-// status, usage, and a preview. It also has a detail screen and a status bar.
+// Session manager UI: a Claude-Code-style overlay that lists sessions with status, usage,
+// and a preview. It also has a detail screen and a status bar. Both read a SessionSource,
+// so they work the same in a worker, in plain pi, and in pi-sm.
 import { homedir } from "node:os";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
@@ -11,15 +12,9 @@ import {
 	type Component,
 	type Focusable,
 } from "@earendil-works/pi-tui";
+import type { Inheritance } from "./control.ts";
 import { compactTokens } from "./footer.ts";
-import {
-	debug,
-	PARENT_ID,
-	titleOf,
-	type LiveSession,
-	type SessionHost,
-	type TranscriptItem,
-} from "./host.ts";
+import { debug } from "./log.ts";
 import {
 	FileExplorer,
 	isCtrl,
@@ -28,11 +23,13 @@ import {
 	setInputValueAtEnd,
 	type SavedSessionInfo,
 } from "./pickers.ts";
+import { activityOf, titleOf, type Row, type SessionSource } from "./remote-source.ts";
+import { emptyUsage, type TranscriptItem } from "./transcript.ts";
 
 type Theme = any;
-type Ctx = any;
 
-export type ManagerResult = { type: "switch"; id: string } | { type: "kill"; id: string } | undefined;
+/** "open" asks the caller to show that session in this terminal. */
+export type ManagerResult = { type: "open"; id: string } | undefined;
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TICK_MS = 100;
@@ -105,36 +102,34 @@ function wrap(text: string, width: number): string[] {
 // ---------------------------------------------------------------------------
 // Status glyphs shared by the manager and the status bar
 
-function spinnerFrame(host: SessionHost, theme: Theme, frame: number): string {
-	const frames = host.workingIndicator?.frames;
-	if (frames !== undefined) return frames.length ? (frames[frame % frames.length] ?? "") : "";
+function spinnerFrame(theme: Theme, frame: number): string {
 	return theme.fg("accent", SPINNER[frame % SPINNER.length] ?? "");
 }
 
-function statusIcon(host: SessionHost, r: LiveSession, theme: Theme, frame: number): string {
-	if (r.state === "error") return theme.fg("error", "✗");
+function statusIcon(r: Row, theme: Theme, frame: number): string {
+	if (r.state === "failed") return theme.fg("error", "✗");
 	if (r.state === "starting") return theme.fg("dim", "◌");
 	if (r.state === "saved") return theme.fg("dim", "◇");
-	const activity = host.activity(r);
+	const activity = activityOf(r);
 	if (activity === "waiting") return theme.bold(theme.fg("warning", "?"));
-	if (activity === "working") return spinnerFrame(host, theme, frame) || theme.fg("accent", "●");
+	if (activity === "working") return spinnerFrame(theme, frame);
 	if (r.lastOutcome === "error") return theme.fg("error", "✗");
 	if (r.lastOutcome === "aborted") return theme.fg("warning", "■");
 	if (r.lastOutcome === "done") return theme.fg("success", "✓");
 	return theme.fg("dim", "○");
 }
 
-function statusText(host: SessionHost, r: LiveSession, theme: Theme): string {
-	if (r.state === "error") return theme.fg("error", `error: ${r.error ?? "failed"}`);
+function statusText(r: Row, theme: Theme): string {
+	if (r.state === "failed") return theme.fg("error", `failed: ${r.error ?? "the worker died"}`);
 	if (r.state === "starting") return theme.fg("dim", "starting…");
 	if (r.state === "saved") return theme.fg("dim", "saved · ⏎ starts it");
-	const activity = host.activity(r);
+	const activity = activityOf(r);
 	if (activity === "waiting") {
 		return theme.fg("warning", r.promptTitle ? `needs input · ${r.promptTitle}` : "needs input");
 	}
 	if (activity === "working") {
 		if (r.tool) return theme.fg("muted", `${r.tool.name}${r.tool.detail ? ` ${r.tool.detail}` : ""}`);
-		return theme.fg("muted", r.streamingText ? "responding…" : "thinking…");
+		return theme.fg("muted", r.reply ? "responding…" : "thinking…");
 	}
 	if (r.lastOutcome === "error") return theme.fg("error", "failed");
 	if (r.lastOutcome === "aborted") return theme.fg("warning", "interrupted");
@@ -143,19 +138,37 @@ function statusText(host: SessionHost, r: LiveSession, theme: Theme): string {
 	return theme.fg("dim", "ready");
 }
 
-function timeText(host: SessionHost, r: LiveSession): string {
-	if (host.activity(r) !== "idle" && r.runStartedAt) return fmtDuration(Date.now() - r.runStartedAt);
+function timeText(r: Row): string {
+	if (activityOf(r) !== "idle" && r.runStartedAt) return fmtDuration(Date.now() - r.runStartedAt);
 	return fmtAgo(r.lastActivityAt);
+}
+
+function usageOf(r: Row) {
+	return r.usage ?? emptyUsage();
+}
+
+function tokensOf(r: Row): number {
+	const u = usageOf(r);
+	return u.input + u.output + u.cacheRead + u.cacheWrite;
+}
+
+/** The newest reply: the streaming tail during a run, the last reply after it. */
+function replyOf(r: Row): string | undefined {
+	if (activityOf(r) === "working" && r.reply?.trim()) return r.reply.trim();
+	return r.lastReply;
 }
 
 // ---------------------------------------------------------------------------
 // Box drawing
 
 class Box {
-	constructor(
-		private readonly theme: Theme,
-		readonly width: number,
-	) {}
+	private readonly theme: Theme;
+	readonly width: number;
+
+	constructor(theme: Theme, width: number) {
+		this.theme = theme;
+		this.width = width;
+	}
 
 	get inner(): number {
 		return Math.max(1, this.width - 4);
@@ -214,25 +227,30 @@ interface PromptState {
 export interface ManagerOptions {
 	tui: any;
 	theme: Theme;
-	host: SessionHost;
-	ctx: Ctx;
+	source: SessionSource;
+	/** The folder for new sessions. */
+	cwd: string;
 	done: (result: ManagerResult) => void;
 	initial?: "resume" | "new";
-	shortcut?: string;
+	/** What new sessions take over from the session that opens the manager. */
+	inherit?: () => Inheritance;
+	/** A notice to show at the start, such as how the last attach ended. */
+	notice?: { text: string; type: "info" | "warning" | "error" };
 }
 
 export class ManagerView implements Component, Focusable {
 	private readonly tui: any;
 	private readonly theme: Theme;
-	private readonly host: SessionHost;
-	private readonly ctx: Ctx;
+	private readonly source: SessionSource;
+	private readonly cwd: string;
+	private readonly inherit: () => Inheritance;
 	private readonly done: (result: ManagerResult) => void;
 	private readonly filter = new Input();
 	private filtering = false;
 	private screen: "list" | "detail" = "list";
-	private selectedId: string;
 	private prompt?: PromptState;
 	private confirmKillId?: string;
+	private selectedId?: string;
 	private sub?: FileExplorer | ResumeSessionPicker;
 	private flash?: { text: string; type: "info" | "warning" | "error"; at: number };
 	private detailScroll = 0;
@@ -246,23 +264,26 @@ export class ManagerView implements Component, Focusable {
 	constructor(opts: ManagerOptions) {
 		this.tui = opts.tui;
 		this.theme = opts.theme;
-		this.host = opts.host;
-		this.ctx = opts.ctx;
+		this.source = opts.source;
+		this.cwd = opts.cwd;
+		this.inherit = opts.inherit ?? (() => ({}));
 		this.done = opts.done;
 		const sessions = this.sessions();
+		const current = this.source.currentId;
 		// Start on the most interesting session that is not the current one.
 		const pick =
-			sessions.find((r) => r.id !== this.host.activeId && this.host.activity(r) === "waiting") ??
-			sessions.find((r) => r.id !== this.host.activeId && r.unread) ??
-			sessions.find((r) => r.id !== this.host.activeId) ??
+			sessions.find((r) => r.id !== current && activityOf(r) === "waiting") ??
+			sessions.find((r) => r.id !== current && r.unread) ??
+			sessions.find((r) => r.id !== current) ??
 			sessions[0];
-		this.selectedId = pick?.id ?? PARENT_ID;
-		this.unsubscribe = this.host.subscribe(() => this.requestRender());
+		this.selectedId = pick?.id;
+		this.unsubscribe = this.source.subscribe(() => this.requestRender());
 		this.timer = setInterval(() => {
 			this.frame++;
 			if (this.flash && Date.now() - this.flash.at > 4000) this.flash = undefined;
 			this.requestRender();
 		}, TICK_MS);
+		if (opts.notice) this.say(opts.notice.text, opts.notice.type);
 		if (opts.initial === "resume") this.openResume();
 		if (opts.initial === "new") this.openPrompt("new");
 	}
@@ -307,13 +328,13 @@ export class ManagerView implements Component, Focusable {
 
 	// --- Data -------------------------------------------------------------
 
-	private sessions(): LiveSession[] {
-		const all = this.host.list();
+	private sessions(): Row[] {
+		const all = this.source.list();
 		const query = this.filter.getValue().trim().toLowerCase();
 		if (!query) return all;
 		const terms = query.split(/\s+/);
 		return all.filter((r) => {
-			const hay = [titleOf(r), r.sessionName, r.cwd, r.firstPrompt, this.host.modelLabel(r), r.id]
+			const hay = [titleOf(r), r.name, r.cwd, r.firstPrompt, r.modelLabel, r.id]
 				.filter(Boolean)
 				.join(" ")
 				.toLowerCase();
@@ -321,7 +342,7 @@ export class ManagerView implements Component, Focusable {
 		});
 	}
 
-	private selected(): LiveSession | undefined {
+	private selected(): Row | undefined {
 		const list = this.sessions();
 		return list.find((r) => r.id === this.selectedId) ?? list[0];
 	}
@@ -354,19 +375,19 @@ export class ManagerView implements Component, Focusable {
 		}
 	}
 
-	private switchTo(r: LiveSession | undefined): void {
+	private switchTo(r: Row | undefined): void {
 		if (!r) return;
-		if (r.id === this.host.activeId) {
+		if (r.id === this.source.currentId) {
 			this.close();
 			return;
 		}
-		this.close({ type: "switch", id: r.id });
+		this.close({ type: "open", id: r.id });
 	}
 
-	private openPrompt(kind: PromptKind, target?: LiveSession): void {
+	private openPrompt(kind: PromptKind, target?: Row): void {
 		const input = new Input();
 		input.focused = true;
-		if (kind === "rename" && target) setInputValueAtEnd(input, target.sessionName ?? "");
+		if (kind === "rename" && target) setInputValueAtEnd(input, target.name ?? "");
 		this.prompt = { kind, targetId: target?.id, input };
 		this.requestRender();
 	}
@@ -376,18 +397,17 @@ export class ManagerView implements Component, Focusable {
 		if (!prompt) return;
 		const value = prompt.input.getValue().trim();
 		this.prompt = undefined;
-		const target = prompt.targetId ? this.host.get(prompt.targetId) : undefined;
+		const target = prompt.targetId ? this.source.get(prompt.targetId) : undefined;
 		if (prompt.kind === "new") {
 			void this.run("New agent", async () => {
-				const cwd = this.ctx.cwd || process.cwd();
 				if (!value) {
-					const child = await this.host.createChild({ cwd, ctx: this.ctx });
-					this.close({ type: "switch", id: child.id });
+					const row = await this.source.create({ cwd: this.cwd, ...this.inherit() });
+					this.close({ type: "open", id: row.id });
 					return;
 				}
-				const child = await this.host.createChild({ cwd, ctx: this.ctx, task: value });
-				this.selectedId = child.id;
-				this.say(`Started agent "${titleOf(child)}" in the background`);
+				const row = await this.source.create({ cwd: this.cwd, task: value, ...this.inherit() });
+				this.selectedId = row.id;
+				this.say(`Started agent "${titleOf(row)}" in the background`);
 			});
 			return;
 		}
@@ -396,17 +416,17 @@ export class ManagerView implements Component, Focusable {
 			return;
 		}
 		if (prompt.kind === "rename") {
-			void this.run("Rename", () => {
+			void this.run("Rename", async () => {
 				if (!value) return;
-				this.host.rename(target, value);
+				await this.source.rename(target.id, value);
 				this.say(`Renamed to "${value}"`);
 			});
 		} else if (prompt.kind === "message") {
 			void this.run("Send", async () => {
 				if (!value) return;
-				const queued = this.host.activity(target) !== "idle";
-				const started = target.state === "saved";
-				await this.host.send(target, value);
+				const queued = activityOf(target) !== "idle";
+				const started = target.state === "saved" || target.state === "failed";
+				await this.source.send(target.id, value);
 				let note = `Sent to "${titleOf(target)}"`;
 				if (queued) note = `Queued for "${titleOf(target)}"`;
 				else if (started) note = `Started "${titleOf(target)}" and sent the message`;
@@ -415,41 +435,33 @@ export class ManagerView implements Component, Focusable {
 		}
 	}
 
-	private interrupt(r: LiveSession | undefined): void {
+	private interrupt(r: Row | undefined): void {
 		if (!r) return;
-		if (this.host.activity(r) === "idle") {
+		if (activityOf(r) === "idle") {
 			this.say("That session is not running", "warning");
 			return;
 		}
 		void this.run("Interrupt", async () => {
-			await this.host.interrupt(r);
+			await this.source.interrupt(r.id);
 			this.say(`Interrupted "${titleOf(r)}"`);
 		});
 	}
 
-	private requestKill(r: LiveSession | undefined): void {
+	private requestKill(r: Row | undefined): void {
 		if (!r) return;
-		if (r.kind === "parent") {
-			this.say("The main session cannot be stopped from here. Use /quit.", "warning");
-			return;
-		}
 		this.confirmKillId = r.id;
 		this.requestRender();
 	}
 
 	private confirmKill(): void {
-		const r = this.confirmKillId ? this.host.get(this.confirmKillId) : undefined;
+		const r = this.confirmKillId ? this.source.get(this.confirmKillId) : undefined;
 		this.confirmKillId = undefined;
 		if (!r) return;
-		if (r.id === this.host.activeId) {
-			// Stopping the session that owns the terminal needs the overlay closed first.
-			this.close({ type: "kill", id: r.id });
-			return;
-		}
 		void this.run("Stop", async () => {
 			const title = titleOf(r);
-			const saved = r.state === "saved";
-			await this.host.stopChild(r.id);
+			const saved = r.state === "saved" || r.state === "failed";
+			// A stop of the session that runs this overlay ends it, and its client returns to its manager.
+			await this.source.stop(r.id);
 			if (this.screen === "detail") this.screen = "list";
 			this.say(saved ? `Removed "${title}" from the list. Its file stays.` : `Stopped "${title}"`);
 		});
@@ -457,14 +469,14 @@ export class ManagerView implements Component, Focusable {
 
 	private openFolder(): void {
 		this.sub = new FileExplorer(
-			this.ctx.cwd || process.cwd(),
+			this.cwd,
 			this.theme,
 			(cwd: string | null) => {
 				this.sub = undefined;
 				if (!cwd) return this.requestRender();
 				void this.run("New session", async () => {
-					const child = await this.host.createChild({ cwd, ctx: this.ctx });
-					this.close({ type: "switch", id: child.id });
+					const row = await this.source.create({ cwd, ...this.inherit() });
+					this.close({ type: "open", id: row.id });
 				});
 			},
 			() => this.requestRender(),
@@ -473,21 +485,23 @@ export class ManagerView implements Component, Focusable {
 	}
 
 	private openResume(): void {
-		const live = new Set(this.host.list().map((r) => r.sessionFile).filter(Boolean));
+		const listed = new Set(this.source.list().map((r) => r.sessionFile).filter(Boolean));
+		let all: SavedSessionInfo[] = [];
 		this.sub = new ResumeSessionPicker(
 			this.theme,
 			async () => {
-				const all = (await SessionManager.listAll()) as SavedSessionInfo[];
-				return all
-					.filter((s) => !live.has(s.path))
+				all = ((await SessionManager.listAll()) as SavedSessionInfo[])
+					.filter((s) => !listed.has(s.path))
 					.sort((a, b) => Number(b.modified) - Number(a.modified));
+				return all;
 			},
 			(sessionPath: string | null) => {
 				this.sub = undefined;
 				if (!sessionPath) return this.requestRender();
 				void this.run("Resume", async () => {
-					const child = await this.host.openSaved(sessionPath, this.ctx);
-					this.close({ type: "switch", id: child.id });
+					const info = all.find((s) => s.path === sessionPath);
+					const row = await this.source.create({ cwd: info?.cwd || this.cwd, sessionFile: sessionPath });
+					this.close({ type: "open", id: row.id });
 				});
 			},
 			() => this.requestRender(),
@@ -580,7 +594,7 @@ export class ManagerView implements Component, Focusable {
 	}
 
 	private handleListInput(data: string): void {
-		if (matchesKey(data, "escape") || data === "q") {
+		if (matchesKey(data, "escape") || data === "q" || matchesKey(data, "ctrl+c")) {
 			if (this.filter.getValue()) {
 				this.filter.setValue("");
 				this.requestRender();
@@ -661,10 +675,10 @@ export class ManagerView implements Component, Focusable {
 
 	private headerCounts(): string {
 		const th = this.theme;
-		const all = this.host.list();
-		const saved = all.filter((r) => r.state === "saved").length;
-		const working = all.filter((r) => this.host.activity(r) === "working").length;
-		const waiting = all.filter((r) => this.host.activity(r) === "waiting").length;
+		const all = this.source.list();
+		const saved = all.filter((r) => r.state === "saved" || r.state === "failed").length;
+		const working = all.filter((r) => activityOf(r) === "working").length;
+		const waiting = all.filter((r) => activityOf(r) === "waiting").length;
 		const parts = [th.fg("muted", `${all.length - saved} live`)];
 		if (saved) parts.push(th.fg("dim", `${saved} saved`));
 		if (working) parts.push(th.fg("accent", `${working} working`));
@@ -675,7 +689,7 @@ export class ManagerView implements Component, Focusable {
 	private renderFooterArea(box: Box, out: string[]): void {
 		const th = this.theme;
 		if (this.prompt) {
-			const target = this.prompt.targetId ? this.host.get(this.prompt.targetId) : undefined;
+			const target = this.prompt.targetId ? this.source.get(this.prompt.targetId) : undefined;
 			const name = target ? titleOf(target) : "session";
 			const labels = {
 				new: "New agent task (empty opens a blank session)",
@@ -689,12 +703,12 @@ export class ManagerView implements Component, Focusable {
 			return;
 		}
 		if (this.confirmKillId) {
-			const target = this.host.get(this.confirmKillId);
+			const target = this.source.get(this.confirmKillId);
 			out.push(box.sep());
-			const running = target && this.host.activity(target) !== "idle" ? " It is still running." : "";
+			const running = target && activityOf(target) !== "idle" ? " It is still running." : "";
 			const name = target ? titleOf(target) : "session";
-			const question =
-				target?.state === "saved" ? `Remove "${name}" from the list? Its file stays.` : `Stop "${name}"?${running}`;
+			const asleep = target?.state === "saved" || target?.state === "failed";
+			const question = asleep ? `Remove "${name}" from the list? Its file stays.` : `Stop "${name}"?${running}`;
 			out.push(
 				box.line(
 					th.fg("warning", `${question} `) +
@@ -705,7 +719,7 @@ export class ManagerView implements Component, Focusable {
 		}
 		if (this.busy) {
 			out.push(box.sep());
-			out.push(box.line(th.fg("muted", `${spinnerFrame(this.host, th, this.frame)} working…`)));
+			out.push(box.line(th.fg("muted", `${spinnerFrame(th, this.frame)} working…`)));
 		} else if (this.flash) {
 			out.push(box.sep());
 			const color = this.flash.type === "info" ? "success" : this.flash.type;
@@ -735,7 +749,9 @@ export class ManagerView implements Component, Focusable {
 		const visible = list.slice(start, start + slots);
 
 		if (!list.length) {
-			out.push(box.line(th.fg("dim", query ? "No sessions match." : "No sessions.")));
+			let empty = query ? "No sessions match." : "No sessions. Press n to start one.";
+			if (!query && this.source.problem) empty = this.source.problem;
+			out.push(box.line(th.fg("dim", empty)));
 			out.push(box.line());
 		}
 		if (start > 0) out.push(box.line(th.fg("dim", `  ↑ ${start} more`)));
@@ -746,13 +762,13 @@ export class ManagerView implements Component, Focusable {
 		out.push(box.sep("preview"));
 		out.push(...this.renderPreview(this.selected(), inner).map((l) => box.line(l)));
 		this.renderFooterArea(box, out);
-		out.push(box.bottom(th.fg("dim", this.host.activeId === PARENT_ID ? "main" : "child")));
+		out.push(box.bottom(this.source.problem && list.length ? th.fg("warning", this.source.problem) : ""));
 		out.push(
 			hints(
 				th,
 				[
 					["↑↓", "select"],
-					["⏎", "switch"],
+					["⏎", "open"],
 					["→", "details"],
 					["n", "new agent"],
 					["m", "message"],
@@ -771,30 +787,30 @@ export class ManagerView implements Component, Focusable {
 	}
 
 	/** Two unframed rows per session. */
-	private renderRow(r: LiveSession, index: number, inner: number): string[] {
+	private renderRow(r: Row, index: number, inner: number): string[] {
 		const th = this.theme;
 		const selected = r.id === this.selected()?.id;
-		const current = r.id === this.host.activeId;
+		const current = r.id === this.source.currentId;
 		const marker = selected ? th.fg("accent", "❯") : " ";
-		const icon = statusIcon(this.host, r, th, this.frame);
+		const icon = statusIcon(r, th, this.frame);
 		const num = index < 9 ? th.fg("dim", `${index + 1}`) : " ";
 		let title = titleOf(r);
 		if (selected) title = th.bold(th.fg("accent", title));
 		else if (r.unread) title = th.bold(title);
 		const tags: string[] = [];
-		if (current) tags.push(th.fg("dim", "(current)"));
-		if (r.kind === "parent") tags.push(th.fg("dim", "main"));
+		if (current) tags.push(th.fg("dim", "(this session)"));
+		else if (r.attached) tags.push(th.fg("dim", "(open elsewhere)"));
+		if (r.pinned) tags.push(th.fg("dim", "pinned"));
 		if (r.unread) tags.push(th.fg("accent", "•"));
-		const right = `${statusText(this.host, r, th)}  ${th.fg("dim", timeText(this.host, r).padStart(7))}`;
+		const right = `${statusText(r, th)}  ${th.fg("dim", timeText(r).padStart(7))}`;
 		const rightW = Math.min(visibleWidth(right), Math.floor(inner * 0.55));
 		const left = `${marker} ${num} ${icon} ${title}${tags.length ? ` ${tags.join(" ")}` : ""}`;
 		const line1 = spread(left, fit(right, rightW), inner);
 
-		const s = this.host.stats(r);
+		const s = usageOf(r);
 		const meta = [shortPath(r.cwd)];
-		const model = this.host.modelLabel(r);
-		if (model) meta.push(model);
-		const tokens = s.input + s.output + s.cacheRead + s.cacheWrite;
+		if (r.modelLabel) meta.push(r.modelLabel);
+		const tokens = tokensOf(r);
 		if (tokens) meta.push(`${fmtTokens(tokens)} tok`);
 		if (s.cost) meta.push(fmtCost(s.cost));
 		if (s.contextPercent != null) meta.push(`ctx ${Math.round(s.contextPercent)}%`);
@@ -802,13 +818,13 @@ export class ManagerView implements Component, Focusable {
 		return [line1, fit(line2, inner)];
 	}
 
-	private renderPreview(r: LiveSession | undefined, inner: number): string[] {
+	private renderPreview(r: Row | undefined, inner: number): string[] {
 		const th = this.theme;
 		const lines: string[] = [];
 		if (!r) return Array.from({ length: PREVIEW_ROWS }, () => "");
-		const prompt = this.host.lastPrompt(r);
+		const prompt = r.lastPrompt ?? r.firstPrompt;
 		lines.push(prompt ? th.fg("accent", "› ") + th.fg("muted", fit(prompt, inner - 2)) : th.fg("dim", "No messages yet."));
-		const reply = this.host.lastReply(r);
+		const reply = replyOf(r);
 		const replyRows = PREVIEW_ROWS - 2;
 		if (reply) {
 			const wrapped = wrap(reply.replace(/\n{2,}/g, "\n"), inner - 2).filter((l) => l.trim());
@@ -817,8 +833,8 @@ export class ManagerView implements Component, Focusable {
 		}
 		while (lines.length < PREVIEW_ROWS - 1) lines.push("");
 		let status = "";
-		const activity = this.host.activity(r);
-		if (activity === "waiting") status = th.fg("warning", `⚠ waiting for you${r.promptTitle ? `: ${r.promptTitle}` : ""}. Press ⏎ to switch.`);
+		const activity = activityOf(r);
+		if (activity === "waiting") status = th.fg("warning", `⚠ waiting for you${r.promptTitle ? `: ${r.promptTitle}` : ""}. Press ⏎ to open it.`);
 		else if (r.tool) status = th.fg("dim", `  ⎿ ${r.tool.name} ${r.tool.detail} (${fmtDuration(Date.now() - r.tool.startedAt)})`);
 		else if (r.error) status = th.fg("error", `  ✗ ${r.error}`);
 		else if (r.lastRunMs && activity === "idle") status = th.fg("dim", `  last run took ${fmtDuration(r.lastRunMs)}`);
@@ -836,19 +852,19 @@ export class ManagerView implements Component, Focusable {
 			this.screen = "list";
 			return this.renderList(width);
 		}
-		const icon = statusIcon(this.host, r, th, this.frame);
+		const icon = statusIcon(r, th, this.frame);
 		out.push(box.top(`${icon} ${th.bold(th.fg("accent", fit(titleOf(r), inner - 30)))}`, this.headerCounts()));
-		const s = this.host.stats(r);
+		const s = usageOf(r);
 		const label = (text: string) => th.fg("muted", text.padEnd(10));
-		const activity = this.host.activity(r);
-		const status = [statusText(this.host, r, th)];
+		const activity = activityOf(r);
+		const status = [statusText(r, th)];
 		if (activity !== "idle" && r.runStartedAt) status.push(th.fg("dim", `running ${fmtDuration(Date.now() - r.runStartedAt)}`));
 		else if (r.lastRunMs) status.push(th.fg("dim", `last run ${fmtDuration(r.lastRunMs)}`));
-		if (r.id === this.host.activeId) status.push(th.fg("dim", "current"));
+		if (r.id === this.source.currentId) status.push(th.fg("dim", "this session"));
+		else if (r.attached) status.push(th.fg("dim", "open elsewhere"));
 		out.push(box.line(label("Status") + status.join(th.fg("dim", " · "))));
 		out.push(box.line(label("Directory") + shortPath(r.cwd)));
-		const model = this.host.modelLabel(r);
-		out.push(box.line(label("Model") + (model || th.fg("dim", "unknown"))));
+		out.push(box.line(label("Model") + (r.modelLabel || th.fg("dim", "unknown"))));
 		out.push(
 			box.line(
 				label("Usage") +
@@ -866,15 +882,18 @@ export class ManagerView implements Component, Focusable {
 		const sessionInfo = [r.sessionId ? r.sessionId.slice(0, 8) : r.id, `started ${fmtAgo(r.createdAt)}`];
 		if (r.sessionFile) sessionInfo.push(shortPath(r.sessionFile));
 		out.push(box.line(label("Session") + th.fg("dim", sessionInfo.join(" · "))));
-		const locks = this.host.locks.heldBy(r.id);
+		const locks = r.locks ?? [];
 		if (locks.length) out.push(box.line(label("Locks") + th.fg("warning", locks.map(shortPath).join(", "))));
 
 		out.push(box.sep("transcript"));
 		const footerExtra = this.prompt || this.confirmKillId || this.busy || this.flash ? 2 : 0;
 		const avail = Math.max(4, this.viewportRows() - out.length - footerExtra - 2);
-		const body = this.renderTranscript(this.host.transcript(r, 120), inner);
+		const items = [...(this.source.transcript(r.id) ?? [])];
+		const streaming = activity === "working" ? r.reply?.trim() : undefined;
+		if (streaming && items.at(-1)?.text !== streaming) items.push({ kind: "assistant", text: streaming });
+		const body = this.renderTranscript(items, inner);
 		if (activity === "waiting") {
-			body.push("", th.fg("warning", `⚠ waiting for you${r.promptTitle ? `: ${r.promptTitle}` : ""}. Press ⏎ to switch.`));
+			body.push("", th.fg("warning", `⚠ waiting for you${r.promptTitle ? `: ${r.promptTitle}` : ""}. Press ⏎ to open it.`));
 		}
 		const maxScroll = Math.max(0, body.length - avail);
 		this.detailScroll = Math.min(this.detailScroll, maxScroll);
@@ -892,7 +911,7 @@ export class ManagerView implements Component, Focusable {
 				th,
 				[
 					["esc", "back"],
-					["⏎", "switch"],
+					["⏎", "open"],
 					["m", "message"],
 					["e", "rename"],
 					["x", "interrupt"],
@@ -953,29 +972,34 @@ export class StatusBar implements Component {
 	private frame = 0;
 	private timer: ReturnType<typeof setInterval> | null = null;
 
-	constructor(
-		private readonly host: SessionHost,
-		private readonly theme: Theme,
-		private readonly requestRender: () => void,
-		private readonly shortcut: string,
-	) {}
+	private readonly source: SessionSource;
+	private readonly theme: Theme;
+	private readonly requestRender: () => void;
+	private readonly shortcut: string;
+
+	constructor(source: SessionSource, theme: Theme, requestRender: () => void, shortcut: string) {
+		this.source = source;
+		this.theme = theme;
+		this.requestRender = requestRender;
+		this.shortcut = shortcut;
+	}
 
 	render(width: number): string[] {
 		// Saved rows stay out of the status bar until they start.
-		const sessions = this.host.list().filter((r) => r.state !== "saved");
-		if (sessions.length < 2) {
+		const sessions = this.source.list().filter((r) => r.state !== "saved");
+		if (!sessions.some((r) => r.id !== this.source.currentId)) {
 			this.setTimer(false);
 			return [];
 		}
 		const th = this.theme;
-		this.setTimer(sessions.some((r) => this.host.activity(r) === "working"));
+		this.setTimer(sessions.some((r) => activityOf(r) === "working"));
 		const segments = sessions.map((r) => {
-			const current = r.id === this.host.activeId;
-			const name = fit(r.sessionName || (r.kind === "parent" ? "main" : titleOf(r)), 20);
+			const current = r.id === this.source.currentId;
+			const name = fit(titleOf(r), 20);
 			let styled = th.fg(r.unread ? "text" : "muted", name);
 			if (current) styled = th.bold(th.fg("accent", name));
 			const dot = r.unread ? th.fg("accent", "•") : "";
-			return `${statusIcon(this.host, r, th, this.frame)} ${styled}${dot}`;
+			return `${statusIcon(r, th, this.frame)} ${styled}${dot}`;
 		});
 		const hint = th.fg("dim", `${this.shortcut} sessions`);
 		let line = "";
@@ -998,7 +1022,7 @@ export class StatusBar implements Component {
 			this.timer = setInterval(() => {
 				this.frame++;
 				this.requestRender();
-			}, this.host.workingIndicator?.intervalMs || TICK_MS);
+			}, TICK_MS);
 		} else if (!on && this.timer) {
 			clearInterval(this.timer);
 			this.timer = null;

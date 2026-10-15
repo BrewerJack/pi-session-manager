@@ -1,7 +1,7 @@
 // End to end: a real supervisor and real pi workers in a throwaway agent dir (spec §12).
 // The tests skip when no pi is on PATH. No test sends a message, so no model runs.
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -12,6 +12,7 @@ import { findPiDir } from "../boot.mjs";
 import { attach, type AttachResult } from "../client.ts";
 import type { SessionRecord } from "../control.ts";
 import { statePaths, type StatePaths } from "../paths.ts";
+import { nameOf, readSessionFile } from "../session-file.ts";
 import { isAlive } from "../supervisor.ts";
 import { connectSupervisor, type SupervisorHandle } from "../supervisor-client.ts";
 
@@ -46,8 +47,8 @@ after(async () => {
 	rmSync(agentDir, { recursive: true, force: true });
 });
 
-async function create(name: string): Promise<SessionRecord> {
-	const request = { cwd: agentDir, name, env: {}, piDir };
+async function create(name: string, extra: Record<string, unknown> = {}): Promise<SessionRecord> {
+	const request = { cwd: agentDir, name, env: {}, piDir, ...extra };
 	const { record } = await handle.connection.request<{ record: SessionRecord }>({ type: "create", request }, 60_000);
 	return record;
 }
@@ -161,4 +162,40 @@ test("/sessions detach leaves the session running", { skip }, async () => {
 	]);
 	assert.deepEqual(result, { kind: "detached", detached: { reason: "quit" } });
 	assert.ok(isAlive(record.pid!));
+});
+
+test("a worker reports its conversation and answers transcript, stats, and rename", { skip }, async () => {
+	const file = path.join(agentDir, "conversation.jsonl");
+	copyFileSync(path.join(ROOT, "test", "fixtures", "conversation.jsonl"), file);
+	const record = await create("ignored", { sessionFile: file });
+	// The file names the session. The worker keeps that name.
+	assert.equal(record.name, "fixture");
+	assert.equal(record.lastPrompt, "Count the files in this folder.");
+	assert.equal(record.lastReply, "The folder holds 7 files.");
+	assert.equal(record.usage?.cost, 0.75);
+	const { items } = await handle.connection.request<{ items: { kind: string }[] }>({ type: "transcript", session: record.id });
+	assert.deepEqual(
+		items.map((i) => i.kind),
+		["user", "assistant", "tool", "assistant"],
+	);
+	const { usage } = await handle.connection.request<{ usage: { toolCalls: number } }>({ type: "stats", session: record.id });
+	assert.equal(usage.toolCalls, 1);
+	await handle.connection.request({ type: "rename", session: record.id, name: "renamed live" });
+	assert.equal(nameOf(readSessionFile(file).entries), "renamed live");
+	await handle.connection.request({ type: "stop", session: record.id }, 30_000);
+});
+
+test("the manager in a worker sends its client to another session", { skip }, async () => {
+	const here = await create("switch-from");
+	const there = await create("switch-to");
+	const viewer = client(await socketOf(here.id));
+	await until(() => viewer.screen().includes("switch-from"), "the screen");
+	// alt+s opens the overlay. It starts on the first session that is not this one.
+	viewer.type("\x1bs");
+	await until(() => viewer.screen().includes("(this session)"), "the overlay");
+	const others = (await handle.connection.request<{ sessions: SessionRecord[] }>({ type: "list" })).sessions;
+	const first = others.find((r) => r.id !== here.id)!;
+	viewer.type("\r");
+	assert.deepEqual(await viewer.done, { kind: "switch", id: first.id });
+	assert.ok(isAlive(there.pid!));
 });

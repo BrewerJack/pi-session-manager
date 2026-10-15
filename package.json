@@ -20,7 +20,6 @@
 	],
 	"files": [
 		"index.ts",
-		"host.ts",
 		"footer.ts",
 		"keys.ts",
 		"locks.ts",
@@ -41,6 +40,11 @@
 		"cli.ts",
 		"boot.mjs",
 		"bin/pi-sm.mjs",
+		"remote-source.ts",
+		"runtime.ts",
+		"session-file.ts",
+		"transcript.ts",
+		"manager-app.ts",
 		"README.md",
 		"LICENSE"
 	],

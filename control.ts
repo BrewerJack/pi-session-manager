@@ -1,11 +1,18 @@
 // Control channel between clients, the supervisor, and workers: one JSON record per line.
 // Readers split only on "\n", never with readline, which also splits on U+2028 and U+2029.
 import net from "node:net";
+import type { Usage } from "./transcript.ts";
 
 export type Outcome = "done" | "aborted" | "error";
 
 /** The states of spec §6.2. */
 export type SessionState = "starting" | "working" | "waiting" | "idle" | "saved" | "failed";
+
+export interface ToolActivity {
+	name: string;
+	detail: string;
+	startedAt: number;
+}
 
 /** One session as the supervisor stores it in sessions/<id>.json (spec §6.1). */
 export interface SessionRecord {
@@ -26,17 +33,53 @@ export interface SessionRecord {
 	env: Record<string, string>;
 	/** The pi package that runs the worker. */
 	piDir: string;
+	/** Model and thinking level, as the list shows them. */
+	modelLabel?: string;
+	usage?: Usage;
+	/** The last user prompt and assistant reply, for the preview. */
+	lastPrompt?: string;
+	lastReply?: string;
+	runStartedAt?: number;
+	lastRunMs?: number;
+	/** The title of the dialog that waits for the user. */
+	promptTitle?: string;
+	/** A run ended while no client held the session. */
+	unread?: boolean;
+	// The fields below change often or only matter while the worker lives. They stay out of the file.
+	/** The running tool. */
+	tool?: ToolActivity;
+	/** The tail of the reply that streams in. */
+	reply?: string;
+	/** A client holds the session. */
+	attached?: boolean;
+	/** Paths that the session holds locks on (spec §9). */
+	locks?: string[];
 }
 
-type Reported = Pick<
-	SessionRecord,
-	"state" | "sessionFile" | "sessionId" | "name" | "cwd" | "firstPrompt" | "lastOutcome" | "error"
->;
+/** Record fields that never reach the disk. */
+export const TRANSIENT_FIELDS = ["tool", "reply", "attached", "locks"] as const;
+
+/** A record without the fields that clients do not need. The env can hold secrets. */
+export type PublicRecord = Omit<SessionRecord, "env">;
+
+export function publicRecord(record: SessionRecord): PublicRecord {
+	const { env: _env, ...rest } = record;
+	return rest;
+}
+
+type Reported = Omit<SessionRecord, "id" | "env" | "piDir" | "pinned" | "createdAt" | "lastActivityAt" | "pid" | "locks">;
 
 /** What a worker reports about its session. null clears a field, because JSON drops undefined. */
 export type WorkerUpdate = { [K in keyof Reported]?: Reported[K] | null };
 
-export interface CreateRequest {
+/** What a new session takes over from the session that starts it (spec §7.2). */
+export interface Inheritance {
+	model?: { provider: string; id: string };
+	thinkingLevel?: string;
+	tools?: string[];
+}
+
+export interface CreateRequest extends Inheritance {
 	cwd: string;
 	task?: string;
 	name?: string;

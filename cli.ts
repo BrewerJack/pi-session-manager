@@ -3,14 +3,15 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import { attach, type AttachResult } from "./client.ts";
+import { attachLoop, describeEnd } from "./client.ts";
 import type { CreateRequest, SessionRecord } from "./control.ts";
 import { loadEnvAllow, pickEnv } from "./env.ts";
 import { agentDirFrom, statePaths, type BootContext, type StatePaths } from "./paths.ts";
 import { connectSupervisor, type SupervisorHandle } from "./supervisor-client.ts";
 
-const USAGE = `usage: pi-sm <command>
+const USAGE = `usage: pi-sm [command]
 
+  (no command)                      Open the manager. Without a terminal, list the sessions.
   list [--json]                     List every session.
   new [options] [task…]             Start a session. Without --bg, attach to it.
       --cwd <dir>                   Folder of the session. Default: the current folder.
@@ -27,6 +28,7 @@ const USAGE = `usage: pi-sm <command>
 type Command = (context: BootContext, paths: StatePaths, args: string[]) => Promise<number>;
 
 const COMMANDS: Record<string, Command> = {
+	manager: managerCommand,
 	list: listCommand,
 	ls: listCommand,
 	new: newCommand,
@@ -36,7 +38,8 @@ const COMMANDS: Record<string, Command> = {
 };
 
 export async function main(context: BootContext, argv: string[]): Promise<number> {
-	const [name = "list", ...args] = argv;
+	const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+	const [name = interactive ? "manager" : "list", ...args] = argv;
 	if (name === "help" || name === "--help" || name === "-h") {
 		process.stdout.write(`${USAGE}\n`);
 		return 0;
@@ -63,6 +66,13 @@ async function open(context: BootContext, paths: StatePaths, start = true): Prom
 		);
 	}
 	return handle;
+}
+
+async function managerCommand(context: BootContext, paths: StatePaths): Promise<number> {
+	if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("the manager needs a terminal.");
+	// The manager loads pi-tui and the theme of pi. The other commands start faster without them.
+	const { runManagerApp } = await import("./manager-app.ts");
+	return runManagerApp(context, paths);
 }
 
 async function listCommand(context: BootContext, paths: StatePaths, args: string[]): Promise<number> {
@@ -138,36 +148,20 @@ async function attachCommand(context: BootContext, paths: StatePaths, args: stri
 
 async function attachTo(context: BootContext, paths: StatePaths, target: string): Promise<number> {
 	if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("attach needs a terminal.");
-	// The manager inside a session can send this client to another session.
-	for (let hops = 0; hops < 100; hops++) {
-		const handle = await open(context, paths);
-		let found: { id: string; socket: string };
-		try {
-			found = await handle.connection.request({ type: "attach", session: target }, 120_000);
-		} finally {
-			handle.connection.close();
-		}
-		const result = await attach(found.socket);
-		if (result.kind === "switch") {
-			target = result.id;
-			continue;
-		}
-		process.stderr.write(`${describeEnd(result, found.id)}\n`);
-		return result.kind === "error" ? 1 : 0;
-	}
-	throw new Error("Too many switches in a row.");
+	const { result, id } = await attachLoop((next) => resolveSocket(context, paths, next), target);
+	const text = describeEnd(result, id);
+	process.stderr.write(result.kind === "error" ? `pi-sm: ${text}\n` : `${text}\n`);
+	return result.kind === "error" ? 1 : 0;
 }
 
-/** What the user reads after an attach ends. */
-export function describeEnd(result: AttachResult, id: string): string {
-	if (result.kind === "error") return `pi-sm: ${result.message}`;
-	if (result.kind === "detached") {
-		const { reason, message } = result.detached;
-		if (reason === "stopped") return `The session ${id} stopped.${message ? ` ${message}` : ""}`;
-		if (reason === "taken") return `Another terminal took over the session. Run "pi-sm attach ${id}" to take it back.`;
-		if (reason === "error") return `The session ${id} sent this terminal away${message ? `: ${message}` : "."}`;
+/** The worker socket of a session, from a short connection to the supervisor. */
+async function resolveSocket(context: BootContext, paths: StatePaths, target: string): Promise<{ id: string; socket: string }> {
+	const handle = await open(context, paths);
+	try {
+		return await handle.connection.request({ type: "attach", session: target }, 120_000);
+	} finally {
+		handle.connection.close();
 	}
-	return `Detached. The session keeps running. Run "pi-sm attach ${id}" to come back.`;
 }
 
 async function stopCommand(context: BootContext, paths: StatePaths, args: string[]): Promise<number> {

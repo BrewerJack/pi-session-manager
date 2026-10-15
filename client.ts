@@ -108,3 +108,38 @@ export function attach(
 		socket.once("close", () => finish({ kind: "closed" }));
 	});
 }
+
+/** Finds the worker socket of a session. A saved session starts first. */
+export type Resolve = (id: string) => Promise<{ id: string; socket: string }>;
+
+/**
+ * Attach to a session, and follow the switches that the manager inside a session sends.
+ * Returns how the last attach ended, and the id of the last session.
+ */
+export async function attachLoop(
+	resolve: Resolve,
+	id: string,
+	streams?: AttachStreams,
+): Promise<{ result: AttachResult; id: string }> {
+	let target = id;
+	for (let hops = 0; hops < 100; hops++) {
+		const found = await resolve(target);
+		const result = await attach(found.socket, streams);
+		if (result.kind !== "switch") return { result, id: found.id };
+		target = result.id;
+	}
+	return { result: { kind: "error", message: "Too many switches in a row." }, id: target };
+}
+
+/** What the user reads after an attach ends. `again` is the command that attaches once more. */
+export function describeEnd(result: AttachResult, id: string, again = `pi-sm attach ${id}`): string {
+	if (result.kind === "error") return result.message;
+	if (result.kind === "detached") {
+		const { reason, message } = result.detached;
+		if (reason === "stopped") return `The session ${id} stopped.${message ? ` ${message}` : ""}`;
+		if (reason === "taken") return `Another terminal took over the session. Run "${again}" to take it back.`;
+		if (reason === "error") return `The session ${id} sent this terminal away${message ? `: ${message}` : "."}`;
+	}
+	return `Detached. The session keeps running. Run "${again}" to come back.`;
+}
+

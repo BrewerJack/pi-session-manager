@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { describeEnd } from "../cli.ts";
+import { describeEnd } from "../client.ts";
 import { recap, RunState } from "../worker.ts";
 
 const MIN = 60_000;
@@ -46,5 +46,5 @@ test("pi-sm explains why an attach ended", () => {
 	assert.match(describeEnd({ kind: "closed" }, "a1"), /^Detached\./);
 	assert.match(describeEnd({ kind: "detached", detached: { reason: "taken" } }, "a1"), /^Another terminal took over/);
 	assert.equal(describeEnd({ kind: "detached", detached: { reason: "stopped", message: "Bye." } }, "a1"), "The session a1 stopped. Bye.");
-	assert.equal(describeEnd({ kind: "error", message: "boom" }, "a1"), "pi-sm: boom");
+	assert.equal(describeEnd({ kind: "error", message: "boom" }, "a1"), "boom");
 });

@@ -1,29 +1,31 @@
-// pi-session-manager: run several agents in one pi process and manage them from a
-// Claude-Code-style overlay. Open it with /sessions or the shortcut (alt+s, or ⌥S on macOS).
+// pi-session-manager: pi sessions that run in the background, each in its own process.
+// The manager overlay lists them, previews them, and opens one in this terminal.
+// Open it with /sessions or the shortcut (alt+s, or ⌥S on macOS).
+//
+// The extension runs in two modes (spec §11). In a worker, it belongs to a background
+// session, and the manager switches the client of the worker to another session. In plain
+// pi, it is a client: opening a session parks the TUI of pi and attaches the terminal.
+import { readFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
 	getAgentDir,
+	getPackageDir,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { getNativeClipboard, type KeyId } from "@earendil-works/pi-tui";
-import {
-	debug,
-	getHost,
-	inferToolPaths,
-	patchWorkingIndicator,
-	summarizeToolArgs,
-	textOf,
-	titleOf,
-	type LiveSession,
-	type Outcome,
-	type SessionHost,
-} from "./host.ts";
+import { attachLoop, describeEnd } from "./client.ts";
+import type { Inheritance } from "./control.ts";
 import { formatBreakdown, type FooterEntry } from "./footer.ts";
 import { displayKey, isMacOptionShortcut, loadKeyConfig, type KeyConfig, type ModifierProbe } from "./keys.ts";
-import type { WorkerBridge } from "./worker.ts";
+import { debug } from "./log.ts";
+import { statePaths, type BootContext } from "./paths.ts";
+import { activityOf, RemoteSource, titleOf, type Row, type SessionSource } from "./remote-source.ts";
+import { totalTokens } from "./transcript.ts";
 import { fmtAgo, fmtCost, fmtDuration, fmtTokens, ManagerView, shortPath, StatusBar, type ManagerResult } from "./ui.ts";
+import type { WorkerBridge } from "./worker.ts";
 
 // pi binds ctrl+r to app.session.rename, so the default is alt+s. Settings can change it.
 let KEYS: KeyConfig = loadKeyConfig(path.join(getAgentDir(), "settings.json"), process.env);
@@ -31,251 +33,187 @@ let KEYS: KeyConfig = loadKeyConfig(path.join(getAgentDir(), "settings.json"), p
 let SHORTCUT = displayKey(KEYS.shortcut, process.platform);
 const WIDGET_KEY = "pi-session-manager";
 const FOOTER_KEY = "pi-session-manager";
+const SOURCE_KEY = Symbol.for("pi-session-manager.source");
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const SUBCOMMANDS: [string, string][] = [
-	["new", "Start an agent. With a task, it runs in the background."],
-	["list", "Show the status of every live session"],
-	["switch", "Switch to a live session by name"],
-	["rename", "Rename the current session"],
-	["stop", "Stop a live child session by name"],
-	["resume", "Open a saved session as a live child"],
+	["new", "Start a session. With a task, it runs in the background."],
+	["list", "Show the status of every session"],
+	["open", "Open a session in this terminal by name"],
+	["rename", "Rename this session"],
+	["stop", "Stop a session by name. Its file stays."],
+	["resume", "Open a saved pi session file as a background session"],
 	["detach", "Leave this background session. It keeps running."],
 ];
 
 type Ctx = ExtensionContext | ExtensionCommandContext;
 
+/** The worker that runs this session, when pi runs as a background worker (spec §7.4). */
+function workerBridge(): WorkerBridge | undefined {
+	return (globalThis as Record<symbol, WorkerBridge | undefined>)[Symbol.for("pi-session-manager.worker")];
+}
+
+function packageVersion(): string {
+	try {
+		return JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8")).version ?? "0.0.0";
+	} catch {
+		return "0.0.0";
+	}
+}
+
+/** One session list per process. pi loads the extension again on /new, /resume, and /reload. */
+function getSource(): RemoteSource {
+	const g = globalThis as Record<symbol, RemoteSource | undefined>;
+	let source = g[SOURCE_KEY];
+	if (!source) {
+		const context: BootContext = { piDir: getPackageDir(), root: ROOT, version: packageVersion() };
+		const currentId = process.env.PI_SESSION_MANAGER_WORKER || undefined;
+		source = new RemoteSource(statePaths(getAgentDir()), context, { currentId, unref: true });
+		// Plain pi starts no supervisor until the user asks for a session.
+		source.watch();
+		g[SOURCE_KEY] = source;
+	}
+	return source;
+}
+
+/** State of one extension instance. */
+interface Instance {
+	pi: ExtensionAPI;
+	source: RemoteSource;
+	/** Stop functions for the parts that session_shutdown removes. */
+	cleanup: (() => void)[];
+	managerOpen: boolean;
+	warnedKeys: boolean;
+}
+
 export default function sessionManager(pi: ExtensionAPI) {
-	const host = getHost();
-	patchWorkingIndicator(host);
 	KEYS = loadKeyConfig(path.join(getAgentDir(), "settings.json"), process.env);
 	SHORTCUT = displayKey(KEYS.shortcut, process.platform);
-	const cleanup: Cleanup = {};
-	const bind: Bind = (ctx) => host.bind(ctx, pi);
+	const self: Instance = { pi, source: getSource(), cleanup: [], managerOpen: false, warnedKeys: false };
 
 	pi.registerCommand("sessions", {
-		description: "Manage live agent sessions (new, list, switch, rename, stop, resume)",
-		getArgumentCompletions: (prefix: string) => completeArgs(host, prefix),
-		handler: async (args: string, ctx: ExtensionCommandContext) => runCommand(pi, host, args.trim(), ctx),
+		description: "Manage background sessions (new, list, open, rename, stop, resume, detach)",
+		getArgumentCompletions: (prefix: string) => completeArgs(self.source, prefix),
+		handler: async (args: string, ctx: ExtensionCommandContext) => runCommand(self, args.trim(), ctx),
 	});
 
 	// SAFETY: loadKeyConfig only returns shortcuts that match the KeyId grammar of pi-tui.
 	pi.registerShortcut(KEYS.shortcut as KeyId, {
 		description: "Open the session manager",
-		handler: async (ctx: ExtensionContext) => openManager(pi, host, ctx),
+		handler: async (ctx: ExtensionContext) => openManager(self, ctx),
 	});
 
-	registerSessionEvents(pi, host, bind, cleanup);
-	registerRunEvents(pi, host, bind);
-	registerPromptEvents(pi, host, bind);
-	registerLockEvents(pi, host, bind);
-}
-
-type Bind = (ctx: Ctx) => LiveSession;
-/** Stop functions for the per-session parts that session_shutdown must remove. */
-type Cleanup = { macKeys?: () => void; footer?: () => void };
-
-/** Session start, metadata changes, and shutdown. */
-function registerSessionEvents(pi: ExtensionAPI, host: SessionHost, bind: Bind, cleanup: Cleanup): void {
-	pi.on("session_start", (event, ctx) => {
-		const r = bind(ctx);
-		// A main session that opens from a file brings back its child sessions as saved rows.
-		if (r.kind === "parent" && event.reason !== "reload") restoreChildren(host, ctx, event.reason);
-		if (ctx.mode === "tui") installSessionUi(pi, host, ctx, cleanup);
-		host.notify();
+	pi.on("session_start", (_event, ctx) => {
+		if (ctx.mode === "tui") installSessionUi(self, ctx);
 	});
 
-	pi.on("session_info_changed", (event, ctx) => {
-		const r = bind(ctx);
-		r.sessionName = event.name || undefined;
-		host.notify();
-	});
-
-	pi.on("model_select", (_event, ctx) => {
-		bind(ctx).statsCache = undefined;
-		host.notifySoon();
-	});
-
-	pi.on("thinking_level_select", (_event, ctx) => {
-		bind(ctx);
-		host.notifySoon();
-	});
-
-	pi.on("session_shutdown", (_event, ctx) => {
-		const r = bind(ctx);
-		// The delayed save may not run before pi exits.
-		if (r.kind === "parent") host.persistMembership();
-		host.locks.release(r.id);
-		cleanup.macKeys?.();
-		cleanup.macKeys = undefined;
-		cleanup.footer?.();
-		cleanup.footer = undefined;
-		try {
-			ctx.ui.setWidget(WIDGET_KEY, undefined);
-		} catch (error) {
-			debug(error);
+	pi.on("session_shutdown", () => {
+		for (const stop of self.cleanup.splice(0)) {
+			try {
+				stop();
+			} catch (error) {
+				debug(error);
+			}
 		}
-		host.notify();
 	});
 }
 
-/** Track each run: start, streaming text, tools, and the outcome. */
-function registerRunEvents(pi: ExtensionAPI, host: SessionHost, bind: Bind): void {
-	pi.on("agent_start", (_event, ctx) => {
-		const r = bind(ctx);
-		const now = Date.now();
-		r.running = true;
-		r.runStartedAt = now;
-		r.lastActivityAt = now;
-		r.lastOutcome = undefined;
-		r.error = undefined;
-		r.tool = undefined;
-		host.notify();
-	});
-
-	pi.on("message_update", (event, ctx) => {
-		const message: any = event.message;
-		if (message?.role !== "assistant") return;
-		const r = bind(ctx);
-		r.streamingText = textOf(message.content).slice(-4000);
-		r.lastActivityAt = Date.now();
-		host.notifySoon();
-	});
-
-	pi.on("message_end", (event, ctx) => {
-		const message: any = event.message;
-		const r = bind(ctx);
-		r.streamingText = undefined;
-		r.lastActivityAt = Date.now();
-		r.statsCache = undefined;
-		if (message?.role === "user" && !r.firstPrompt) r.firstPrompt = textOf(message.content).trim().slice(0, 200);
-		if (message?.role === "assistant" && message.stopReason === "error" && message.errorMessage) {
-			r.error = String(message.errorMessage);
-		}
-		host.notifySoon();
-	});
-
-	pi.on("tool_execution_start", (event, ctx) => {
-		if (event.parentToolCallId) return;
-		const r = bind(ctx);
-		r.tool = {
-			id: event.toolCallId,
-			name: event.toolName,
-			detail: summarizeToolArgs(event.toolName, event.args),
-			startedAt: Date.now(),
-		};
-		r.lastActivityAt = Date.now();
-		host.notifySoon();
-	});
-
-	pi.on("tool_execution_end", (event, ctx) => {
-		const r = bind(ctx);
-		if (r.tool?.id === event.toolCallId) r.tool = undefined;
-		r.lastActivityAt = Date.now();
-		host.notifySoon();
-	});
-
-	pi.on("agent_settled", (event, ctx) => {
-		const r = bind(ctx);
-		let outcome: Outcome = "done";
-		if (event.aborted) outcome = "aborted";
-		else if (r.error) outcome = "error";
-		finishRun(host, r, outcome);
-	});
-}
-
-/** Count dialogs that wait for the user, so the manager can show "needs input". */
-function registerPromptEvents(pi: ExtensionAPI, host: SessionHost, bind: Bind): void {
-	pi.on("ui_prompt_start", (event, ctx) => {
-		const r = bind(ctx);
-		// Our own overlay and the parent handoff are custom UIs too. Skip them.
-		if (event.kind === "custom" && r.ownPromptPending > 0) {
-			r.ownPromptPending--;
-			r.ignoredPromptEnds++;
-			return;
-		}
-		r.promptDepth++;
-		r.promptTitle = event.title;
-		r.lastActivityAt = Date.now();
-		if (r.id !== host.activeId) {
-			const what = event.title ? `: ${event.title}` : "";
-			host.notifyActive(`? "${titleOf(r)}" needs your input${what}. Press ${SHORTCUT} to switch.`, "warning");
-		}
-		host.notify();
-	});
-
-	pi.on("ui_prompt_end", (event, ctx) => {
-		const r = bind(ctx);
-		if (event.kind === "custom" && r.ignoredPromptEnds > 0) {
-			r.ignoredPromptEnds--;
-			return;
-		}
-		r.promptDepth = Math.max(0, r.promptDepth - 1);
-		if (!r.promptDepth) r.promptTitle = undefined;
-		host.notify();
-	});
-}
-
-/** Hold path locks for the duration of each write. */
-function registerLockEvents(pi: ExtensionAPI, host: SessionHost, bind: Bind): void {
-	pi.on("tool_call", (event, ctx) => {
-		const r = bind(ctx);
-		const paths = inferToolPaths(event.toolName, event.input);
-		if (!paths.length) return undefined;
-		const result = host.locks.acquire(r.id, paths, ctx.cwd || r.cwd);
-		if (!result.ok) {
-			const owners = [...new Set(result.conflicts.map((c) => titleOf(host.get(c.by) ?? r)))];
-			const held = [...new Set(result.conflicts.map((c) => shortPath(c.heldPath)))];
-			return {
-				block: true,
-				reason: `Another live session (${owners.join(", ")}) is writing ${held.join(", ")}. Wait for it to finish, or work elsewhere.`,
-			};
-		}
-		host.locks.heldByToolCall.set(event.toolCallId, { sessionId: r.id, paths: result.paths });
-		return undefined;
-	});
-
-	pi.on("tool_result", (event) => {
-		host.locks.releaseByToolCall(event.toolCallId);
-		return undefined;
-	});
-}
-
-function restoreChildren(host: SessionHost, ctx: ExtensionContext, reason: string): void {
-	const restored = host.loadMembership(ctx, reason);
-	if (!restored || !ctx.hasUI) return;
-	const what = restored === 1 ? "1 saved session" : `${restored} saved sessions`;
-	ctx.ui.notify(`Restored ${what}. Press ${SHORTCUT} to open one.`, "info");
-}
-
-/** The status bar, the footer breakdown, and the macOS shortcut of one session. */
-function installSessionUi(pi: ExtensionAPI, host: SessionHost, ctx: ExtensionContext, cleanup: Cleanup): void {
-	installStatusBar(ctx, host);
-	cleanup.footer?.();
-	cleanup.footer = installFooterBreakdown(pi, host, ctx);
-	cleanup.macKeys?.();
-	cleanup.macKeys = installMacOptionKey(pi, host, ctx);
-	if (host.warnedKeys) return;
-	host.warnedKeys = true;
+/** The status bar, the footer breakdown, the notices about other sessions, and the macOS shortcut. */
+function installSessionUi(self: Instance, ctx: ExtensionContext): void {
+	for (const stop of self.cleanup.splice(0)) stop();
+	self.cleanup.push(installStatusBar(self.source, ctx));
+	self.cleanup.push(installFooterBreakdown(self.source, ctx));
+	self.cleanup.push(watchOthers(self.source, ctx));
+	// A worker has no keyboard. Its client handles the macOS key.
+	if (!workerBridge()) {
+		const stop = installMacOptionKey(self, ctx);
+		if (stop) self.cleanup.push(stop);
+	}
+	if (self.warnedKeys) return;
+	self.warnedKeys = true;
 	for (const warning of KEYS.warnings) ctx.ui.notify(warning, "warning");
 }
 
-function finishRun(host: SessionHost, r: LiveSession, outcome: Outcome): void {
-	if (!r.running) return;
-	const now = Date.now();
-	r.running = false;
-	r.tool = undefined;
-	r.streamingText = undefined;
-	r.lastOutcome = outcome;
-	r.lastRunMs = r.runStartedAt ? now - r.runStartedAt : undefined;
-	r.lastActivityAt = now;
-	r.statsCache = undefined;
-	if (r.id !== host.activeId) {
-		r.unread = true;
-		const took = r.lastRunMs ? ` in ${fmtDuration(r.lastRunMs)}` : "";
-		if (outcome === "done") host.notifyActive(`✓ "${titleOf(r)}" finished${took}`, "info");
-		else if (outcome === "error") host.notifyActive(`✗ "${titleOf(r)}" failed: ${r.error ?? "error"}`, "error");
-		else host.notifyActive(`■ "${titleOf(r)}" was interrupted`, "warning");
-	}
-	host.notify();
+function installStatusBar(source: SessionSource, ctx: ExtensionContext): () => void {
+	ctx.ui.setWidget(
+		WIDGET_KEY,
+		(tui: any, theme: any) => {
+			const bar = new StatusBar(source, theme, () => tui.requestRender(), SHORTCUT);
+			const unsubscribe = source.subscribe(() => tui.requestRender());
+			return {
+				render: (width: number) => bar.render(width),
+				invalidate: () => bar.invalidate(),
+				dispose: () => {
+					unsubscribe();
+					bar.dispose();
+				},
+			};
+		},
+		{ placement: "belowEditor" },
+	);
+	return () => ctx.ui.setWidget(WIDGET_KEY, undefined);
+}
+
+/**
+ * Keep a per-session token breakdown in the footer. Updates come at most once a second.
+ */
+function installFooterBreakdown(source: SessionSource, ctx: ExtensionContext): () => void {
+	let shown = "";
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const update = () => {
+		timer = undefined;
+		const entries: FooterEntry[] = source.list().map((r) => ({
+			name: titleOf(r),
+			tokens: totalTokens(r.usage),
+			contextPercent: r.usage?.contextPercent ?? null,
+			cost: r.usage?.cost ?? 0,
+			current: r.id === source.currentId,
+			saved: r.state === "saved" || r.state === "failed",
+		}));
+		const text = formatBreakdown(entries, ctx.ui.theme);
+		if (text === shown) return;
+		shown = text;
+		try {
+			ctx.ui.setStatus(FOOTER_KEY, text || undefined);
+		} catch (error) {
+			debug(error);
+		}
+	};
+	const unsubscribe = source.subscribe(() => {
+		timer ??= setTimeout(update, 1000);
+		timer.unref?.();
+	});
+	update();
+	return () => {
+		unsubscribe();
+		if (timer) clearTimeout(timer);
+		timer = undefined;
+		ctx.ui.setStatus(FOOTER_KEY, undefined);
+	};
+}
+
+/** Tell the user when another session finishes or needs input. Nobody else looks at it then. */
+function watchOthers(source: SessionSource, ctx: ExtensionContext): () => void {
+	const seen = new Map<string, Row["state"]>();
+	for (const row of source.list()) seen.set(row.id, row.state);
+	return source.subscribe(() => {
+		for (const row of source.list()) {
+			const before = seen.get(row.id);
+			seen.set(row.id, row.state);
+			if (before === undefined || before === row.state || row.id === source.currentId || row.attached) continue;
+			const title = titleOf(row);
+			if (row.state === "waiting") {
+				const what = row.promptTitle ? `: ${row.promptTitle}` : "";
+				ctx.ui.notify(`? "${title}" needs your input${what}. Press ${SHORTCUT} to open it.`, "warning");
+			} else if (before === "working" && row.state === "idle") {
+				const took = row.lastRunMs ? ` in ${fmtDuration(row.lastRunMs)}` : "";
+				if (row.lastOutcome === "error") ctx.ui.notify(`✗ "${title}" failed: ${row.error ?? "error"}`, "error");
+				else if (row.lastOutcome === "aborted") ctx.ui.notify(`■ "${title}" was interrupted`, "warning");
+				else ctx.ui.notify(`✓ "${title}" finished${took}`, "info");
+			} else if (row.state === "failed") {
+				ctx.ui.notify(`✗ "${title}" stopped: ${row.error ?? "the worker died"}`, "error");
+			}
+		}
+	});
 }
 
 /** pi's macOS native helper, or undefined when pi runs elsewhere or without it (for example over SSH). */
@@ -302,138 +240,117 @@ function macModifierProbe(): ModifierProbe | undefined {
  * Open the manager when a macOS terminal turns Option+S into "ß". Terminals that
  * send alt+s, such as ones with "Option as Meta" turned on, use the normal shortcut.
  */
-function installMacOptionKey(pi: ExtensionAPI, host: SessionHost, ctx: ExtensionContext): (() => void) | undefined {
+function installMacOptionKey(self: Instance, ctx: ExtensionContext): (() => void) | undefined {
 	if (!KEYS.macOptionChars.length) return undefined;
 	const pressed = macModifierProbe();
 	if (!pressed) return undefined;
 	return ctx.ui.onTerminalInput((data) => {
-		if (host.managerOpen || !isMacOptionShortcut(data, KEYS.macOptionChars, pressed)) return undefined;
-		if (host.bind(ctx, pi).id !== host.activeId) return undefined;
-		void openManager(pi, host, ctx).catch((error) => debug(error));
+		if (self.managerOpen || !isMacOptionShortcut(data, KEYS.macOptionChars, pressed)) return undefined;
+		void openManager(self, ctx).catch((error) => debug(error));
 		return { consume: true };
 	});
 }
 
-/**
- * Keep a per-session token breakdown in the footer of this session. Each session has its
- * own footer, so every session runs this for itself. Updates come at most once a second.
- */
-function installFooterBreakdown(pi: ExtensionAPI, host: SessionHost, ctx: ExtensionContext): () => void {
-	const self = host.bind(ctx, pi).id;
-	let shown = "";
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	const update = () => {
-		timer = undefined;
-		const entries: FooterEntry[] = host.list().map((r) => {
-			const s = host.stats(r);
-			return {
-				name: r.sessionName || (r.kind === "parent" ? "main" : titleOf(r)),
-				tokens: s.input + s.output + s.cacheRead + s.cacheWrite,
-				contextPercent: s.contextPercent,
-				cost: s.cost,
-				current: r.id === self,
-				saved: r.state === "saved",
-			};
-		});
-		const text = formatBreakdown(entries, ctx.ui.theme);
-		if (text === shown) return;
-		shown = text;
-		try {
-			ctx.ui.setStatus(FOOTER_KEY, text || undefined);
-		} catch (error) {
-			debug(error);
-		}
-	};
-	const unsubscribe = host.subscribe(() => {
-		timer ??= setTimeout(update, 1000);
-		timer.unref?.();
-	});
-	update();
-	return () => {
-		unsubscribe();
-		if (timer) clearTimeout(timer);
-		timer = undefined;
-		try {
-			ctx.ui.setStatus(FOOTER_KEY, undefined);
-		} catch (error) {
-			debug(error);
-		}
-	};
+/** The model, thinking level, and tools that a new session takes over from this one. */
+function inheritFrom(ctx: Ctx): Inheritance {
+	const inherit: Inheritance = {};
+	if (ctx.model) inherit.model = { provider: ctx.model.provider, id: ctx.model.id };
+	if (ctx.thinkingLevel) inherit.thinkingLevel = ctx.thinkingLevel;
+	try {
+		const tools = (ctx as ExtensionCommandContext).getSystemPromptOptions?.()?.selectedTools;
+		if (Array.isArray(tools)) inherit.tools = [...tools];
+	} catch (error) {
+		debug(error);
+	}
+	return inherit;
 }
 
-function installStatusBar(ctx: ExtensionContext, host: SessionHost): void {
-	ctx.ui.setWidget(
-		WIDGET_KEY,
-		(tui: any, theme: any) => {
-			const bar = new StatusBar(host, theme, () => tui.requestRender(), SHORTCUT);
-			const unsubscribe = host.subscribe(() => tui.requestRender());
-			return {
-				render: (width: number) => bar.render(width),
-				invalidate: () => bar.invalidate(),
-				dispose: () => {
-					unsubscribe();
-					bar.dispose();
-				},
-			};
-		},
-		{ placement: "belowEditor" },
-	);
-}
-
-async function openManager(
-	pi: ExtensionAPI,
-	host: SessionHost,
-	ctx: Ctx,
-	initial?: "resume" | "new",
-): Promise<void> {
+async function openManager(self: Instance, ctx: Ctx, initial?: "resume" | "new"): Promise<void> {
+	const { source } = self;
 	if (ctx.mode !== "tui") {
-		ctx.ui.notify(statusReport(host), "info");
+		ctx.ui.notify(statusReport(source), "info");
 		return;
 	}
-	if (host.managerOpen) return;
-	const r = host.bind(ctx, pi);
-	r.ownPromptPending++;
-	host.managerOpen = true;
+	if (self.managerOpen) return;
+	self.managerOpen = true;
+	// The user asks for sessions now. Start the supervisor if none runs.
+	source.ensureConnected().catch((error) => debug(error));
 	let result: ManagerResult;
 	try {
-		result = await ctx.ui.custom<ManagerResult>(
-			(tui, theme, _keybindings, done) =>
-				new ManagerView({ tui, theme, host, ctx, done, initial, shortcut: SHORTCUT }),
-			{ overlay: true, overlayOptions: { width: "94%", minWidth: 60, maxHeight: "92%", anchor: "center" } },
-		);
+		const show = () =>
+			ctx.ui.custom<ManagerResult>(
+				(tui, theme, _keybindings, done) =>
+					new ManagerView({ tui, theme, source, cwd: ctx.cwd || process.cwd(), done, initial, inherit: () => inheritFrom(ctx) }),
+				{ overlay: true, overlayOptions: { width: "94%", minWidth: 60, maxHeight: "92%", anchor: "center" } },
+			);
+		const bridge = workerBridge();
+		result = bridge ? await bridge.ownPrompt(show) : await show();
 	} finally {
-		host.managerOpen = false;
-		// If pi did not report the overlay as a prompt, drop the unused marker.
-		if (r.ownPromptPending > 0) r.ownPromptPending--;
+		self.managerOpen = false;
 	}
-	await applyResult(host, ctx, result);
+	if (result?.type === "open") await openSession(source, ctx, result.id);
 }
 
-async function applyResult(host: SessionHost, ctx: Ctx, result: ManagerResult): Promise<void> {
-	if (!result) return;
-	try {
-		if (result.type === "switch") await host.activateFromContext(ctx, result.id);
-		else if (result.type === "kill") await host.stopChild(result.id);
-	} catch (error: any) {
-		ctx.ui.notify(String(error?.message || error), "error");
+/** Show a session in this terminal. A worker hands its client over. Plain pi attaches. */
+async function openSession(source: SessionSource, ctx: Ctx, id: string): Promise<void> {
+	const bridge = workerBridge();
+	if (bridge) {
+		if (id !== bridge.id) bridge.switchTo(id);
+		return;
 	}
+	await attachFromPi(source, ctx, id);
 }
 
-function statusReport(host: SessionHost): string {
-	const lines = host.list().map((r, i) => {
-		const s = host.stats(r);
-		const activity = host.activity(r);
-		const state = describeState(r, activity);
-		const current = r.id === host.activeId ? " (current)" : "";
-		const usage = `${fmtTokens(s.input + s.output + s.cacheRead + s.cacheWrite)} tok · ${fmtCost(s.cost)}`;
-		return `${i + 1}. ${titleOf(r)}${current} · ${state} · ${shortPath(r.cwd)} · ${usage} · ${fmtAgo(r.lastActivityAt)}`;
+/**
+ * Park the TUI of plain pi inside a custom UI and give the terminal to a worker. The TUI
+ * comes back when the user detaches, and the notice says how the attach ended.
+ */
+async function attachFromPi(source: SessionSource, ctx: Ctx, id: string): Promise<void> {
+	let ended: { text: string; type: "info" | "warning" | "error" } | undefined;
+	await ctx.ui.custom<void>((tui, _theme, _keybindings, done) => {
+		try {
+			tui.stop();
+		} catch (error) {
+			debug(error);
+		}
+		attachLoop((next) => source.attach(next), id)
+			.then(({ result, id: last }) => {
+				const text = describeEnd(result, last, `/sessions open ${source.get(last)?.name ?? last}`);
+				ended = { text, type: result.kind === "error" ? "error" : "info" };
+			})
+			.catch((error) => {
+				ended = { text: String(error?.message ?? error), type: "error" };
+			})
+			.finally(() => {
+				try {
+					tui.start();
+					tui.requestRender(true);
+				} catch (error) {
+					debug(error);
+				}
+				done();
+			});
+		return { render: () => [], invalidate: () => {} };
 	});
-	return [`${lines.length} live session(s):`, ...lines].join("\n");
+	if (ended) ctx.ui.notify(ended.text, ended.type);
 }
 
-function describeState(r: LiveSession, activity: string): string {
-	if (r.state === "error") return `error: ${r.error}`;
+function statusReport(source: SessionSource): string {
+	const rows = source.list();
+	if (!rows.length) return source.problem ?? "No sessions.";
+	const lines = rows.map((r, i) => {
+		const current = r.id === source.currentId ? " (this session)" : "";
+		const usage = `${fmtTokens(totalTokens(r.usage))} tok · ${fmtCost(r.usage?.cost ?? 0)}`;
+		return `${i + 1}. ${titleOf(r)}${current} · ${describeState(r)} · ${shortPath(r.cwd)} · ${usage} · ${fmtAgo(r.lastActivityAt)}`;
+	});
+	return [`${lines.length} session(s):`, ...lines].join("\n");
+}
+
+function describeState(r: Row): string {
+	if (r.state === "failed") return `failed: ${r.error ?? "the worker died"}`;
 	if (r.state === "saved") return "saved";
+	if (r.state === "starting") return "starting";
+	const activity = activityOf(r);
 	if (activity === "waiting") return "needs input";
 	if (activity !== "working") return r.lastOutcome ?? "ready";
 	const elapsed = r.runStartedAt ? fmtDuration(Date.now() - r.runStartedAt) : "";
@@ -441,7 +358,7 @@ function describeState(r: LiveSession, activity: string): string {
 	return `working ${elapsed}${tool}`;
 }
 
-function completeArgs(host: SessionHost, prefix: string) {
+function completeArgs(source: SessionSource, prefix: string) {
 	const [sub = "", ...rest] = prefix.split(/\s+/);
 	if (!rest.length) {
 		const items = SUBCOMMANDS.flatMap(([name, description]) =>
@@ -449,69 +366,65 @@ function completeArgs(host: SessionHost, prefix: string) {
 		);
 		return items.length ? items : null;
 	}
-	if (sub !== "switch" && sub !== "stop") return null;
+	if (sub !== "open" && sub !== "switch" && sub !== "stop") return null;
 	const query = rest.join(" ").toLowerCase();
-	const items = host.list().flatMap((r) => {
-		if (sub === "stop" && r.kind !== "child") return [];
-		const name = r.sessionName || titleOf(r);
+	const items = source.list().flatMap((r) => {
+		const name = r.name || titleOf(r);
 		if (!name.toLowerCase().includes(query)) return [];
-		return [{ value: `${sub} ${name}`, label: name, description: `${host.activity(r)} · ${shortPath(r.cwd)}` }];
+		return [{ value: `${sub} ${name}`, label: name, description: `${describeState(r)} · ${shortPath(r.cwd)}` }];
 	});
 	return items.length ? items : null;
 }
 
-type SubcommandHandler = (pi: ExtensionAPI, host: SessionHost, ctx: ExtensionCommandContext, value: string) => Promise<void>;
+type SubcommandHandler = (self: Instance, ctx: ExtensionCommandContext, value: string) => Promise<void>;
 
-async function newCommand(_pi: ExtensionAPI, host: SessionHost, ctx: ExtensionCommandContext, value: string): Promise<void> {
+async function newCommand(self: Instance, ctx: ExtensionCommandContext, value: string): Promise<void> {
 	const cwd = ctx.cwd || process.cwd();
+	const row = await self.source.create({ cwd, task: value || undefined, ...inheritFrom(ctx) });
 	if (!value) {
-		const child = await host.createChild({ cwd, ctx });
-		await applyResult(host, ctx, { type: "switch", id: child.id });
+		await openSession(self.source, ctx, row.id);
 		return;
 	}
-	const child = await host.createChild({ cwd, ctx, task: value });
-	ctx.ui.notify(`Started agent "${titleOf(child)}" in the background. Press ${SHORTCUT} to manage it.`, "info");
+	ctx.ui.notify(`Started "${titleOf(row)}" in the background. Press ${SHORTCUT} to manage it.`, "info");
 }
 
-async function listCommand(_pi: ExtensionAPI, host: SessionHost, ctx: ExtensionCommandContext): Promise<void> {
-	ctx.ui.notify(statusReport(host), "info");
+async function listCommand(self: Instance, ctx: ExtensionCommandContext): Promise<void> {
+	await self.source.ensureConnected().catch((error) => debug(error));
+	ctx.ui.notify(statusReport(self.source), "info");
 }
 
-async function switchCommand(_pi: ExtensionAPI, host: SessionHost, ctx: ExtensionCommandContext, value: string): Promise<void> {
-	const target = value ? host.get(value) : undefined;
+async function openCommand(self: Instance, ctx: ExtensionCommandContext, value: string): Promise<void> {
+	await self.source.ensureConnected();
+	const target = value ? self.source.get(value) : undefined;
 	if (!target) {
-		ctx.ui.notify(value ? `No live session matches "${value}".` : "Usage: /sessions switch <name>", "warning");
+		ctx.ui.notify(value ? `No session matches "${value}".` : "Usage: /sessions open <name>", "warning");
 		return;
 	}
-	await applyResult(host, ctx, { type: "switch", id: target.id });
+	await openSession(self.source, ctx, target.id);
 }
 
-async function renameCommand(pi: ExtensionAPI, host: SessionHost, ctx: ExtensionCommandContext, value: string): Promise<void> {
+async function renameCommand(self: Instance, ctx: ExtensionCommandContext, value: string): Promise<void> {
 	if (!value) {
 		ctx.ui.notify("Usage: /sessions rename <new name>", "warning");
 		return;
 	}
-	host.rename(host.bind(ctx, pi), value);
+	self.pi.setSessionName(value);
 	ctx.ui.notify(`Renamed this session to "${value}".`, "info");
 }
 
-async function stopCommand(_pi: ExtensionAPI, host: SessionHost, ctx: ExtensionCommandContext, value: string): Promise<void> {
-	const target = value ? host.get(value) : undefined;
-	if (!target || target.kind !== "child") {
-		ctx.ui.notify(value ? `No live child session matches "${value}".` : "Usage: /sessions stop <name>", "warning");
+async function stopCommand(self: Instance, ctx: ExtensionCommandContext, value: string): Promise<void> {
+	await self.source.ensureConnected();
+	const target = value ? self.source.get(value) : undefined;
+	if (!target) {
+		ctx.ui.notify(value ? `No session matches "${value}".` : "Usage: /sessions stop <name>", "warning");
 		return;
 	}
 	const title = titleOf(target);
-	await host.stopChild(target.id);
-	ctx.ui.notify(`Stopped "${title}".`, "info");
+	await self.source.stop(target.id);
+	ctx.ui.notify(`Stopped "${title}". Its session file stays.`, "info");
 }
 
-/** The worker that runs this session, when pi runs as a background worker (spec §7.4). */
-function workerBridge(): WorkerBridge | undefined {
-	return (globalThis as Record<symbol, WorkerBridge | undefined>)[Symbol.for("pi-session-manager.worker")];
-}
-
-async function detachCommand(_pi: ExtensionAPI, _host: SessionHost, ctx: ExtensionCommandContext): Promise<void> {
+async function detachCommand(_self: Instance, ctx: ExtensionCommandContext): Promise<void> {
 	const bridge = workerBridge();
 	if (!bridge) {
 		ctx.ui.notify("This session runs in this terminal. Only a background session can detach.", "warning");
@@ -521,28 +434,29 @@ async function detachCommand(_pi: ExtensionAPI, _host: SessionHost, ctx: Extensi
 }
 
 const SUBCOMMAND_HANDLERS: Record<string, SubcommandHandler> = {
-	"": (pi, host, ctx) => openManager(pi, host, ctx),
+	"": (self, ctx) => openManager(self, ctx),
 	new: newCommand,
 	list: listCommand,
 	status: listCommand,
-	switch: switchCommand,
+	open: openCommand,
+	switch: openCommand,
+	attach: openCommand,
 	rename: renameCommand,
 	stop: stopCommand,
 	kill: stopCommand,
-	resume: (pi, host, ctx) => openManager(pi, host, ctx, "resume"),
+	resume: (self, ctx) => openManager(self, ctx, "resume"),
 	detach: detachCommand,
 };
 
-async function runCommand(pi: ExtensionAPI, host: SessionHost, args: string, ctx: ExtensionCommandContext) {
+async function runCommand(self: Instance, args: string, ctx: ExtensionCommandContext) {
 	const [sub = "", ...rest] = args.split(/\s+/);
-	host.bind(ctx, pi);
 	const handler = SUBCOMMAND_HANDLERS[sub.toLowerCase()];
 	if (!handler) {
 		ctx.ui.notify(`Unknown subcommand "${sub}". Try: ${SUBCOMMANDS.map(([n]) => n).join(", ")}.`, "warning");
 		return;
 	}
 	try {
-		await handler(pi, host, ctx, rest.join(" ").trim());
+		await handler(self, ctx, rest.join(" ").trim());
 	} catch (error: any) {
 		debug(error);
 		ctx.ui.notify(String(error?.message || error), "error");

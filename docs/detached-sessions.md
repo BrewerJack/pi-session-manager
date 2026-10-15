@@ -365,14 +365,17 @@ In M1, `<session>` is an id, a name, an id prefix, or the start of a name or fir
 | --- | --- | --- |
 | `hello { version }` | `{ version, pid }` | M1 |
 | `list` | `{ sessions: [record…] }` | M1 |
-| `create { request: { cwd, task?, name?, sessionFile?, env, piDir } }` | `{ record }` after the worker connects. A `sessionFile` that a listed session uses returns that session. | M1 |
+| `create { request: { cwd, task?, name?, sessionFile?, env, piDir, model?, thinkingLevel?, tools? } }` | `{ record }` after the worker connects. A `sessionFile` that a listed session uses returns that session. The last three are the inheritance of §7.2 (M3). | M1 |
 | `attach { session }` | `{ id, socket }`. A `saved` or `failed` session starts first. | M1 |
 | `stop { session }` | `{}` after the worker exits | M1 |
 | `shutdown { keepWorkers }` | `{}`, then the supervisor exits | M1 |
-| `subscribe` | A stream of `changed { record }` and `removed { id }` | |
-| `send { id, text }` | `ok`. A `saved` session starts first. | |
-| `interrupt { id }`, `rename { id, name }`, `pin { id, pinned }` | `ok` | |
-| `transcript { id, max }`, `stats { id }` | Data for the preview and detail screen | |
+| `subscribe` | `{ sessions }`, then a stream of `changed { record }` and `removed { session }` | M3 |
+| `send { session, text }` | `{}`. A `saved` session starts first. A busy session queues the text. | M3 |
+| `interrupt { session }`, `rename { session, name }`, `pin { session, pinned }` | `{}` | M3 |
+| `transcript { session, max }`, `stats { session }` | `{ items }` and `{ usage }`, for the detail screen | M3 |
+
+Events carry the session id in `session`, because `id` correlates requests.
+No answer and no event carries the `env` of a record.
 
 The supervisor reads transcript and stats of `saved` rows from the session file.
 For live rows it asks the worker.
@@ -447,7 +450,7 @@ Each milestone ends with a working build and passing tests.
 | M0 | Spike: one worker with `SocketTerminal`, and a raw attach client | A session runs, detaches, survives the client, and redraws on attach. Q1 has an answer. |
 | M1 | Supervisor, registry, `create`, `list`, `stop` | `pi-sm list` shows sessions from two terminals. |
 | M2 | Attach and detach over the supervisor, `/quit` patch, `pi-sm attach` | §7.3 and §7.4 work from the shell. |
-| M3 | `SessionSource` and the manager overlay in clients and workers | The overlay lists, previews, and switches sessions. |
+| M3 | `SessionSource` and the manager overlay in clients and workers. Attach from plain pi moved here from M4. | The overlay lists, previews, and switches sessions. |
 | M4 | Plain pi as client, `/sessions bg`, `startDetached` | A plain session moves to the background. The main session is invisible. |
 | M5 | Path locks in the supervisor | The lock test passes. |
 | M6 | Idle reaping, crash restart, supervisor recovery, reboot | §7.6 works. |
@@ -563,4 +566,50 @@ A manual run in a PTY on Linux with pi 1.2.0 showed these results:
 
 Lesson from the Q4 run: keys typed into a worker with a logged-in model reach the model when a command does not match.
 Tests that type into a worker use an agent dir without a login.
+
+### M3: done on 2026-10-15
+
+M3 puts the manager on top of the supervisor. The in-process host of 0.3.0 is gone.
+
+| File | Job |
+| --- | --- |
+| `remote-source.ts` | `SessionSource`, and `RemoteSource` over the supervisor protocol. It keeps a copy of all records, which `changed` and `removed` events update. |
+| `ui.ts` | `ManagerView` and `StatusBar` read a `SessionSource` only. |
+| `index.ts` | Worker mode and client mode (§11). ⏎ in a worker sends a `switch` to the client. ⏎ in plain pi parks its TUI and attaches. |
+| `manager-app.ts` | `pi-sm` without a command opens the manager in a terminal with no pi session. A detach brings the manager back. |
+| `runtime.ts` | `createRuntime` and the inheritance of model, thinking level, and tools from `host.ts`, for the worker |
+| `transcript.ts`, `session-file.ts` | Transcript and usage of a branch. The supervisor reads saved sessions without pi. |
+
+Changes in the worker and the supervisor:
+
+- The worker reports the fields that the list shows: model, usage, last prompt and reply, the running tool,
+  the streaming reply at most every 250 ms, the dialog title, `attached`, and `unread`.
+- The worker answers `send`, `interrupt`, `rename`, `transcript`, and `stats`. The manager overlay of the
+  worker does not count as a dialog of the session.
+- The supervisor writes a record to disk only when a lasting field changes. The streaming reply, the tool,
+  `attached`, and the locks stay in memory.
+- `rename` of a saved session appends a `session_info` entry to its file, as pi does.
+
+Attach from plain pi moved from M4 to M3. The overlay in plain pi needs it for ⏎, and the old in-process host
+would otherwise need an adapter for one milestone. M4 keeps `/sessions bg`, `startDetached`, and the `--resume` route.
+
+Parts of 0.3.0 that M3 drops:
+
+- Path locks do not run between M3 and M5. They protected the in-process children, which M3 removes.
+- The status bar spinner no longer copies the frames of pi's working indicator. It uses its own frames.
+- The child list entry of a main session is no longer written. M7 imports the old lists (§11.1).
+
+A manual run in a PTY on Linux with pi 1.2.0, with an agent dir without a login, showed these results:
+
+- `pi-sm` lists two sessions. ⏎ attaches. `alt+s` in the worker opens the overlay, and ⏎ there moves the terminal to the other session.
+  `ctrl+d` returns to the `pi-sm` manager with a notice. `q` ends `pi-sm`.
+- Plain pi shows the sessions in its status bar and its footer. The overlay previews a session and shows its detail screen.
+  ⏎ attaches, and `ctrl+d` returns to plain pi with a notice.
+
+Bug found on the way: plain pi ended while it waited for the `attach` answer. Its TUI was stopped, and the supervisor
+socket was unref'd, so nothing held the event loop. `RemoteSource` now refs the socket while a request runs.
+
+Tests: `test/remote-source.test.ts` runs the client side against a supervisor with fake workers.
+`test/session-file.test.ts` and `test/ui.test.ts` cover the file reader and the views.
+`test/e2e.test.ts` adds a worker that answers transcript, stats, and rename, and the `switch` from the overlay of a worker.
 
