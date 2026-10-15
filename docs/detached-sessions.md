@@ -151,6 +151,50 @@ The supervisor writes records atomically: write to a temp file, then rename.
 
 `stopped` is not a state. A stop removes the record and keeps the session file.
 
+### 6.3 Environment
+
+A worker starts with the environment of the supervisor.
+The supervisor inherits the environment of the client that started it.
+On top of that, each `create` carries the allowed variables of its client, and they win.
+The record keeps only these allowed variables, so a restart (§7.6) sees the same values.
+Other variables never reach the record or any file.
+
+The default allow list:
+
+| Group | Variables |
+| --- | --- |
+| Shell | `PATH`, `LANG`, `LC_*`, `TZ`, `EDITOR`, `VISUAL` |
+| Terminal | `TERM`, `COLORTERM`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION` |
+| Proxy | `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and the lowercase forms |
+| pi | `PI_CACHE_RETENTION`, `PI_HARDWARE_CURSOR`, `PI_HYPERLINKS`, `PI_IMAGE_PROTOCOL`, `PI_OFFLINE`, `PI_SKIP_VERSION_CHECK`, `PI_TELEMETRY`, `PI_TRUE_COLOR`, `PI_TUI_ESC_TIMEOUT` |
+
+The default list holds no credentials.
+A provider key such as `ANTHROPIC_API_KEY` reaches a worker only through the supervisor environment,
+or when the user adds it to the list.
+
+These variables never pass, even when the user lists them:
+
+- `PI_CODING_AGENT_DIR`. Each agent dir has its own supervisor (§6).
+- `PI_SESSION_FILE`, `PI_SESSION_ID`, and `PI_SESSION_MANAGER_WORKER`. They name one session only.
+
+#### Configuration
+
+The setting `sessionManager.env` in `~/.pi/agent/settings.json` adds variables to the default list:
+
+```json
+{
+  "sessionManager": {
+    "env": ["AWS_PROFILE", "AWS_REGION", "GITHUB_*"]
+  }
+}
+```
+
+- Each entry is an exact name, or a prefix that ends in `*`.
+- The client reads the setting, so each client sends the variables of its own settings.
+- A variable that the user adds here lands in the record, even when it holds a secret.
+  The README warns about this. The record has mode `0600`.
+- The environment variable `PI_SESSION_MANAGER_ENV` adds more names, separated by commas.
+
 ## 7. Lifecycle
 
 ### 7.1 Supervisor start
@@ -169,7 +213,7 @@ It keeps its workers alive across the restart.
 ### 7.2 New session
 
 1. The client sends `create { cwd, task?, name?, model?, thinkingLevel?, tools?, env }`.
-   `env` holds the environment of the client, so the worker sees the same `PATH` and credentials.
+   `env` holds the allowed variables of the client (§6.3).
 2. The supervisor writes the record with state `starting` and spawns a worker.
 3. The worker opens or creates the session file and creates its runtime.
    It reuses `createRuntime` and the inheritance logic from `host.ts`.
@@ -408,7 +452,7 @@ The plain pi process then attaches to that worker.
 | Q2 | May a `tool_call` handler return a promise that pi awaits? | Answered: yes. See §9. |
 | Q3 | Does any pi code write to `process.stdout` outside the `Terminal`? | Answered (§8.4). |
 | Q4 | Do extensions with a global state break when each session gets its own process? This mostly helps them. | Test with the extensions of the user in M2. |
-| Q5 | Should the record keep the full client `env`, or only an allow list? It may hold secrets. | Decide before M1. The record has mode `0600` either way. |
+| Q5 | Should the record keep the full client `env`, or only an allow list? It may hold secrets. | Answered: an allow list with user additions (§6.3). |
 | Q6 | Does a second pi process that opens a session file of a live worker corrupt it? | Test in M1. If yes, the extension routes `--resume` of a live session to attach, as Claude Code does. |
 | Q7 | Can the client run the external editor (`ctrl+g`) for a worker and send the text back? | After M7. |
 | Q8 | pi-tui detects terminal capabilities, such as images, from the environment at startup. A worker keeps the values of the terminal that started it. Should `hello` override them for each client? | Before M3. `hello` already carries `term`, `colorterm`, and `termProgram`. |
