@@ -1,8 +1,8 @@
-// Path locks: two live sessions must not write the same path tree at once.
+// Path locks: two live sessions must not write the same path tree at once (spec §9).
+// The supervisor holds the locks. This module does not import pi, so the supervisor starts fast.
 import { existsSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { debug } from "./log.ts";
 function asString(value: unknown): string | null {
 	return typeof value === "string" && value.trim() ? value : null;
 }
@@ -48,8 +48,8 @@ export function canonicalPath(absolute: string): string {
 	}
 	try {
 		return path.join(realpathSync.native(existing), ...rest);
-	} catch (error) {
-		debug(error);
+	} catch {
+		// An unreadable folder keeps its spelling. The lock is then only as strict as the path.
 		return absolute;
 	}
 }
@@ -120,5 +120,25 @@ export class LockManager {
 	heldBy(sessionId: string): string[] {
 		return [...this.locks.entries()].flatMap(([p, info]) => (info.sessionId === sessionId ? [p] : []));
 	}
+}
+
+/** The answer of the supervisor to a lock request. */
+export interface LockAnswer {
+	granted: boolean;
+	/** Who holds the paths that conflict. */
+	owners?: string[];
+	held?: string[];
+}
+
+function homeShort(p: string): string {
+	const home = os.homedir();
+	return p === home || p.startsWith(`${home}${path.sep}`) ? `~${p.slice(home.length)}` : p;
+}
+
+/** The reason that the model reads when a write is blocked. */
+export function blockReason(answer: LockAnswer): string {
+	const owners = answer.owners?.length ? answer.owners.join(", ") : "another session";
+	const held = (answer.held ?? []).map(homeShort).join(", ");
+	return `Another session (${owners}) is writing ${held || "this path"}. Wait for it to finish, or work elsewhere.`;
 }
 

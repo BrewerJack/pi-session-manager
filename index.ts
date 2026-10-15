@@ -20,6 +20,7 @@ import { attachLoop, describeEnd } from "./client.ts";
 import type { Inheritance } from "./control.ts";
 import { formatBreakdown, type FooterEntry } from "./footer.ts";
 import { displayKey, isMacOptionShortcut, loadKeyConfig, type KeyConfig, type ModifierProbe } from "./keys.ts";
+import { blockReason, inferToolPaths } from "./locks.ts";
 import { debug } from "./log.ts";
 import { statePaths, type BootContext } from "./paths.ts";
 import { Registry } from "./registry.ts";
@@ -123,6 +124,21 @@ export default function sessionManager(pi: ExtensionAPI) {
 		installSessionUi(self, ctx);
 		if (!workerBridge()) routeAtStart(self, event.reason, ctx);
 	});
+
+	// A worker takes its locks in its own inline extension. Plain pi takes them here (spec §9).
+	if (!process.env.PI_SESSION_MANAGER_WORKER) {
+		pi.on("tool_call", async (event, ctx) => {
+			const paths = inferToolPaths(event.toolName, event.input);
+			if (!paths.length) return undefined;
+			const label = `plain pi in ${shortPath(ctx.cwd || process.cwd())}`;
+			const answer = await self.source.acquireLock(paths, ctx.cwd || process.cwd(), event.toolCallId, label);
+			return answer.granted ? undefined : { block: true, reason: blockReason(answer) };
+		});
+		pi.on("tool_result", (event) => {
+			self.source.releaseLock(event.toolCallId);
+			return undefined;
+		});
+	}
 
 	pi.on("session_shutdown", () => {
 		for (const stop of self.cleanup.splice(0)) {

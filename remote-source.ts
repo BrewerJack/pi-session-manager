@@ -3,6 +3,7 @@
 // all records, which the supervisor updates with changed and removed events.
 import path from "node:path";
 import type { Connection, CreateRequest, Inheritance, Message, PublicRecord } from "./control.ts";
+import type { LockAnswer } from "./locks.ts";
 import { loadEnvAllow, pickEnv } from "./env.ts";
 import type { BootContext, StatePaths } from "./paths.ts";
 import { connectSupervisor } from "./supervisor-client.ts";
@@ -168,6 +169,29 @@ export class RemoteSource implements SessionSource {
 
 	attach(id: string): Promise<{ id: string; socket: string }> {
 		return this.request({ type: "attach", session: id }, 120_000);
+	}
+
+	/**
+	 * Locks for a write of plain pi (spec §9). Without a supervisor, no session runs in the
+	 * background, so nothing can conflict. A late answer lets the write go ahead.
+	 */
+	async acquireLock(paths: string[], cwd: string, toolCallId: string, label: string): Promise<LockAnswer> {
+		const connection = this.connection;
+		if (!connection || connection.isClosed) return { granted: true };
+		this.inFlight++;
+		connection.socket.ref();
+		try {
+			return await connection.request<LockAnswer>({ type: "lock.acquire", paths, cwd, toolCallId, label }, 5_000);
+		} catch {
+			return { granted: true };
+		} finally {
+			this.inFlight--;
+			if (this.unref && this.inFlight === 0) connection.socket.unref();
+		}
+	}
+
+	releaseLock(toolCallId: string): void {
+		this.connection?.send({ type: "lock.release", toolCallId });
 	}
 
 	// --- Connection -------------------------------------------------------

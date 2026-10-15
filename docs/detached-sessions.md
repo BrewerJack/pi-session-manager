@@ -345,9 +345,11 @@ The supervisor updates the record and pushes a `changed` event to subscribed cli
 ## 9. Path locks
 
 `LockManager` moves into the supervisor.
-The `tool_call` hook in a worker sends `lock.acquire { paths, cwd, toolCallId }` and waits for the answer.
+The `tool_call` hook in a worker sends `lock.acquire { paths, cwd, toolCallId }` and waits for the answer `{ granted, owners?, held? }`.
 `tool_result` sends `lock.release { toolCallId }`.
 The supervisor releases all locks of a worker when its control connection closes.
+Plain pi takes locks the same way over its client connection, with a `label` that names it in a conflict.
+It asks only while a supervisor runs. Without one, no background session can conflict.
 
 pi awaits each `tool_call` handler in turn (`ExtensionRunner.emitToolCall`), so the hook can wait for the supervisor.
 If the supervisor does not answer within 5 seconds, the hook allows the write and logs a warning.
@@ -635,4 +637,20 @@ It skips without pi or `script`.
 
 Lesson: pi moves `*.jsonl` files out of the root of the agent dir at startup, as a migration of old session files.
 Tests keep their session files in another folder.
+
+### M5: done on 2026-10-15
+
+M5 moves the path locks into the supervisor (§9):
+
+- The supervisor keeps one `LockManager` for all sessions. A worker owns locks by its session id. A client connection,
+  such as plain pi, owns them by a key of its own and names itself with a `label`.
+- The inline extension of the worker sends `lock.acquire` from `tool_call` and `lock.release` from `tool_result`.
+  Without a supervisor, or without an answer in 5 seconds, the write goes ahead and the worker log gets a warning.
+- A blocked write returns the reason to the model. It names the session that holds the path, as in 0.3.0.
+- A closed connection and an ended worker release their locks.
+- The detail screen shows the locks of a session again. They travel in the transient `locks` field of the record.
+- `locks.ts` no longer imports pi, so the supervisor still starts without it.
+
+`test/supervisor-locks.test.ts` is the lock test of §12: two workers write one path, and the second write is blocked
+until the first releases it. It also covers the release on a closed connection and a lock of plain pi.
 

@@ -19,6 +19,7 @@ import {
 	type WorkerUpdate,
 } from "./control.ts";
 import { openLog, routeConsoleToLog, type Log } from "./filelog.ts";
+import { blockReason, inferToolPaths, type LockAnswer } from "./locks.ts";
 import {
 	encodeFrame,
 	encodeJsonFrame,
@@ -41,6 +42,8 @@ const ORPHAN_AFTER_MS = 60_000;
 const RECONNECT_MS = 2_000;
 /** Streaming text goes to the supervisor at most this often (spec §8.5). */
 const REPLY_THROTTLE_MS = 250;
+/** A write waits this long for the supervisor to grant its locks. Then it goes ahead (spec §9). */
+const LOCK_TIMEOUT_MS = 5_000;
 
 export interface WorkerOptions {
 	id: string;
@@ -328,6 +331,17 @@ function reporter(link: SupervisorLink, run: RunState, session: () => any) {
 			const meta = message?.role === "user" ? sessionMeta(ctx.sessionManager) : {};
 			link.update({ ...meta, ...sessionFacts(session()), reply: null });
 		});
+		// Path locks (spec §9). pi awaits each tool_call handler, so the write waits for the answer.
+		pi.on("tool_call", async (event, ctx) => {
+			const paths = inferToolPaths(event.toolName, event.input);
+			if (!paths.length) return undefined;
+			const answer = await link.acquire(paths, ctx.cwd, event.toolCallId);
+			return answer.granted ? undefined : { block: true, reason: blockReason(answer) };
+		});
+		pi.on("tool_result", (event) => {
+			link.release(event.toolCallId);
+			return undefined;
+		});
 		pi.on("tool_execution_start", (event) => {
 			if (event.parentToolCallId) return;
 			const detail = summarizeToolArgs(event.toolName, event.args);
@@ -470,6 +484,25 @@ class SupervisorLink {
 	update(patch: WorkerUpdate): void {
 		Object.assign(this.snapshot, patch);
 		this.connection?.send({ type: "worker.update", update: patch });
+	}
+
+	/** Ask for the locks of a write. Without an answer in 5 seconds, the write goes ahead. */
+	async acquire(paths: string[], cwd: string, toolCallId: string): Promise<LockAnswer> {
+		const connection = this.connection;
+		if (!connection) {
+			this.log("warning: no supervisor for the lock of", paths.join(", "), "- the write goes ahead.");
+			return { granted: true };
+		}
+		try {
+			return await connection.request<LockAnswer>({ type: "lock.acquire", paths, cwd, toolCallId }, LOCK_TIMEOUT_MS);
+		} catch (error) {
+			this.log("warning: the lock request failed - the write goes ahead.", error);
+			return { granted: true };
+		}
+	}
+
+	release(toolCallId: string): void {
+		this.connection?.send({ type: "lock.release", toolCallId });
 	}
 
 	private async connect(): Promise<void> {

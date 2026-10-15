@@ -20,6 +20,7 @@ import {
 } from "./control.ts";
 import { workerEnv } from "./env.ts";
 import { openLog, routeConsoleToLog, type Log } from "./filelog.ts";
+import { LockManager, type LockAnswer } from "./locks.ts";
 import {
 	agentDirFrom,
 	newSessionId,
@@ -83,6 +84,11 @@ export class Supervisor {
 	private readonly connections = new Set<Connection>();
 	/** Clients that receive changed and removed events. */
 	private readonly subscribers = new Set<Connection>();
+	/** Path locks of all sessions (spec §9). A worker owns locks by its id, a client by a key per connection. */
+	readonly locks = new LockManager();
+	/** Names of clients that hold locks, such as a plain pi session. */
+	private readonly lockLabels = new Map<string, string>();
+	private nextClient = 1;
 	private server?: net.Server;
 	private sweepTimer?: ReturnType<typeof setInterval>;
 
@@ -168,19 +174,75 @@ export class Supervisor {
 	private accept(connection: Connection): void {
 		this.connections.add(connection);
 		let workerId: string | undefined;
+		const clientKey = `client-${this.nextClient++}`;
+		const owner = () => workerId ?? clientKey;
 		connection.onMessage((message) => {
 			if (message.type === "worker.hello") {
 				workerId = String(message.workerId ?? "");
 				return this.workerHello(workerId, message, connection);
 			}
 			if (message.type === "worker.update" && workerId) return this.workerUpdate(workerId, message.update as WorkerUpdate);
+			if (message.type === "lock.acquire") return { ...this.lockAcquire(owner(), message) };
+			if (message.type === "lock.release") return this.lockRelease(owner(), String(message.toolCallId ?? ""));
 			return this.clientRequest(message, connection);
 		});
 		connection.socket.on("close", () => {
 			this.connections.delete(connection);
 			this.subscribers.delete(connection);
+			// A closed connection holds no locks (spec §9). A worker that reconnects starts clean.
+			this.releaseLocks(owner());
 			if (workerId) this.workerDisconnected(workerId, connection);
 		});
+	}
+
+	// --- Path locks -----------------------------------------------------
+
+	private lockAcquire(owner: string, message: Message): LockAnswer {
+		const paths = Array.isArray(message.paths) ? message.paths.filter((p): p is string => typeof p === "string") : [];
+		const cwd = typeof message.cwd === "string" && message.cwd ? message.cwd : homedir();
+		const toolCallId = String(message.toolCallId ?? "");
+		if (typeof message.label === "string" && message.label) this.lockLabels.set(owner, message.label);
+		const result = this.locks.acquire(owner, paths, cwd);
+		if (!result.ok) {
+			const owners = [...new Set(result.conflicts.map((c) => this.ownerName(c.by)))];
+			const held = [...new Set(result.conflicts.map((c) => c.heldPath))];
+			this.log(`lock for ${owner} blocked by ${owners.join(", ")}: ${held.join(", ")}`);
+			return { granted: false, owners, held };
+		}
+		this.locks.heldByToolCall.set(`${owner}\0${toolCallId}`, { sessionId: owner, paths: result.paths });
+		this.showLocks(owner);
+		return { granted: true };
+	}
+
+	private lockRelease(owner: string, toolCallId: string): ReplyData {
+		this.locks.releaseByToolCall(`${owner}\0${toolCallId}`);
+		this.showLocks(owner);
+		return {};
+	}
+
+	private releaseLocks(owner: string): void {
+		if (!this.locks.heldBy(owner).length) return;
+		this.locks.release(owner);
+		for (const key of [...this.locks.heldByToolCall.keys()]) {
+			if (key.startsWith(`${owner}\0`)) this.locks.heldByToolCall.delete(key);
+		}
+		this.showLocks(owner);
+	}
+
+	private ownerName(owner: string): string {
+		const record = this.records.get(owner);
+		if (record) return record.name || record.firstPrompt || record.id;
+		return this.lockLabels.get(owner) ?? "a pi session";
+	}
+
+	/** The detail screen shows the locks of a session. They stay out of the file. */
+	private showLocks(owner: string): void {
+		const record = this.records.get(owner);
+		if (!record) return;
+		const held = this.locks.heldBy(owner);
+		if (held.length) record.locks = held;
+		else delete record.locks;
+		this.save(record, false);
 	}
 
 	private clientRequest(message: Message, connection: Connection): ReplyData | Promise<ReplyData> {
@@ -497,6 +559,7 @@ export class Supervisor {
 	private gone(id: string, error?: string): void {
 		const record = this.records.get(id);
 		if (!record) return;
+		this.releaseLocks(id);
 		const live = this.live.get(id);
 		rmSync(workerSocket(this.paths, id), { force: true });
 		if (live?.ending === "forget") {
