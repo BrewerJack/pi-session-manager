@@ -1,6 +1,6 @@
 # Detached sessions
 
-Status: draft, 2026-10-14. Target release: 0.4.0.
+Status: draft, 2026-10-14. Target release: 0.4.0, published to npm once M7 is done. No prerelease and no 1.0.0 with it.
 
 This document specifies how pi-session-manager moves from one process for all sessions
 to a supervisor with one process per session.
