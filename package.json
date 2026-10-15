@@ -31,10 +31,22 @@
 		"socket-terminal.ts",
 		"client.ts",
 		"worker.ts",
-		"worker-boot.mjs",
+		"supervisor.ts",
+		"supervisor-client.ts",
+		"registry.ts",
+		"control.ts",
+		"env.ts",
+		"paths.ts",
+		"filelog.ts",
+		"cli.ts",
+		"boot.mjs",
+		"bin/pi-sm.mjs",
 		"README.md",
 		"LICENSE"
 	],
+	"bin": {
+		"pi-sm": "bin/pi-sm.mjs"
+	},
 	"scripts": {
 		"typecheck": "tsc -p tsconfig.json",
 		"test": "node --test 'test/*.test.ts'"

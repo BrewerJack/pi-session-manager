@@ -1,13 +1,16 @@
 // Worker: runs one pi session in its own process and draws it to a SocketTerminal.
 // Clients attach over a Unix socket. Detach, /quit, and a closed client all leave the
-// session alive. Only SIGTERM stops the worker.
+// session alive. A stop from the supervisor, or SIGTERM, ends the worker.
 //
-// worker-boot.mjs loads this file through the jiti of pi. pi itself comes in as `sdk`
-// and `tui`, so the worker shares one module instance with pi and its extensions.
-import { appendFileSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+// boot.mjs loads this file through the jiti of pi. pi itself comes in as `sdk` and
+// `tui`, so the worker shares one module instance with pi and its extensions.
+import { mkdirSync, rmSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { format } from "node:util";
+import { parseArgs } from "node:util";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { connect, type Connection, type ReplyData, type WorkerUpdate } from "./control.ts";
+import { openLog, routeConsoleToLog, type Log } from "./filelog.ts";
 import {
 	encodeFrame,
 	encodeJsonFrame,
@@ -23,28 +26,44 @@ import { SocketTerminal, type TuiDeps } from "./socket-terminal.ts";
 
 type Sdk = typeof import("@earendil-works/pi-coding-agent");
 
+/** A worker without a supervisor for this long ends itself (spec §7.6). */
+const ORPHAN_AFTER_MS = 60_000;
+const RECONNECT_MS = 2_000;
+
 export interface WorkerOptions {
 	id: string;
+	/** Control socket of the supervisor. */
+	supervisor: string;
 	/** Socket that clients attach to. */
 	socket: string;
-	/** JSON file with the pid, socket, and session file of this worker. */
-	infoFile: string;
 	logFile: string;
 	cwd: string;
 	sessionFile?: string;
 	task?: string;
+	name?: string;
 	/** Root of the pi package, for modules that pi does not export. */
 	piDir: string;
 }
 
-export interface WorkerInfo {
-	id: string;
-	pid: number;
-	socket: string;
-	cwd: string;
-	sessionFile?: string;
-	sessionId?: string;
-	startedAt: number;
+export function parseWorkerArgs(argv: string[], piDir: string): WorkerOptions {
+	const { values } = parseArgs({
+		args: argv,
+		options: {
+			id: { type: "string" },
+			supervisor: { type: "string" },
+			socket: { type: "string" },
+			log: { type: "string" },
+			cwd: { type: "string" },
+			session: { type: "string" },
+			task: { type: "string" },
+			name: { type: "string" },
+		},
+	});
+	const { id, supervisor, socket, log, cwd } = values;
+	if (!id || !supervisor || !socket || !log || !cwd) {
+		throw new Error("worker needs --id, --supervisor, --socket, --log, and --cwd.");
+	}
+	return { id, supervisor, socket, logFile: log, cwd, sessionFile: values.session, task: values.task, name: values.name, piDir };
 }
 
 export async function runWorker(sdk: Sdk, tui: TuiDeps, options: WorkerOptions): Promise<void> {
@@ -53,16 +72,25 @@ export async function runWorker(sdk: Sdk, tui: TuiDeps, options: WorkerOptions):
 	process.on("SIGHUP", () => log("SIGHUP ignored"));
 	process.on("unhandledRejection", (error) => log("unhandledRejection", error));
 
+	let attachments: Attachments | undefined;
+	const link = new SupervisorLink(options, log, {
+		stop: () => attachments?.stop("stopped"),
+		orphan: () => attachments?.stop("stopped", "The supervisor is gone.") ?? process.exit(0),
+	});
+
 	const agentDir = sdk.getAgentDir();
 	const sessionManager = options.sessionFile
 		? sdk.SessionManager.open(options.sessionFile, undefined, undefined)
 		: sdk.SessionManager.create(options.cwd, undefined, {});
-	const runtime = await sdk.createAgentSessionRuntime(createRuntimeFactory(sdk), {
+	const runtime = await sdk.createAgentSessionRuntime(createRuntimeFactory(sdk, reporter(link)), {
 		cwd: sessionManager.getCwd?.() || options.cwd,
 		agentDir,
 		sessionManager,
 	});
 	await applyNetworkSettings(options.piDir, runtime.services.settingsManager, log);
+	const sm = runtime.session.sessionManager;
+	if (options.name?.trim() && !sm.getSessionName?.()) runtime.session.setSessionName(options.name.trim());
+	link.update({ ...sessionMeta(sm), state: "idle" });
 
 	const terminal = new SocketTerminal(tui);
 	const mode = new sdk.InteractiveMode(runtime, {
@@ -73,22 +101,20 @@ export async function runWorker(sdk: Sdk, tui: TuiDeps, options: WorkerOptions):
 		initialMessages: [],
 		terminal,
 	});
-	const attachments = new Attachments(mode, terminal, log);
+	attachments = new Attachments(mode, terminal, log);
 	attachments.patchShutdown();
 
 	await mode.init();
 	// No client holds the session yet. Stop the TUI so it does not render for nobody.
 	attachments.parkUi();
 
-	const server = await listen(options.socket, (socket) => attachments.accept(socket));
-	writeInfo(options, runtime);
-	const cleanup = () => {
+	const server = await listen(options.socket, (socket) => attachments?.accept(socket));
+	process.on("exit", () => {
 		server.close();
 		rmSync(options.socket, { force: true });
-		rmSync(options.infoFile, { force: true });
-	};
-	process.on("exit", cleanup);
+	});
 	log(`worker ${options.id} ready on ${options.socket}`);
+	link.start();
 
 	await mode.run();
 }
@@ -97,12 +123,17 @@ export async function runWorker(sdk: Sdk, tui: TuiDeps, options: WorkerOptions):
 // Runtime
 
 /** The createRuntime of pi's main, without CLI flags and without a trust prompt. */
-function createRuntimeFactory(sdk: Sdk) {
+function createRuntimeFactory(sdk: Sdk, extension: (pi: ExtensionAPI) => void) {
 	const trustStore = new sdk.ProjectTrustStore(sdk.getAgentDir());
 	return async ({ cwd, agentDir, sessionManager, sessionStartEvent }: any) => {
 		const projectTrusted = !sdk.hasTrustRequiringProjectResources(cwd) || trustStore.get(cwd) === true;
 		const settingsManager = sdk.SettingsManager.create(cwd, agentDir, { projectTrusted });
-		const services = await sdk.createAgentSessionServices({ cwd, agentDir, settingsManager });
+		const services = await sdk.createAgentSessionServices({
+			cwd,
+			agentDir,
+			settingsManager,
+			resourceLoaderOptions: { extensionFactories: [extension] },
+		});
 		if (!projectTrusted) {
 			services.diagnostics.push({ type: "warning", message: `Project resources are not trusted: ${cwd}` });
 		}
@@ -123,21 +154,165 @@ async function applyNetworkSettings(piDir: string, settingsManager: any, log: Lo
 	}
 }
 
-function writeInfo(options: WorkerOptions, runtime: any): void {
-	const sm = runtime.session.sessionManager;
-	const info: WorkerInfo = {
-		id: options.id,
-		pid: process.pid,
-		socket: options.socket,
-		cwd: sm.getCwd?.() || options.cwd,
-		sessionFile: sm.getSessionFile?.(),
-		sessionId: sm.getSessionId?.(),
-		startedAt: Date.now(),
+// ---------------------------------------------------------------------------
+// State reports: an inline extension forwards session events to the supervisor (spec §8.5).
+
+function textOf(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content.flatMap((part: any) => (part?.type === "text" && typeof part.text === "string" ? [part.text] : [])).join(" ");
+}
+
+function oneLine(text: string, max = 200): string {
+	return text.replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+function sessionMeta(sm: any): WorkerUpdate {
+	const meta: WorkerUpdate = {};
+	try {
+		meta.sessionFile = sm.getSessionFile?.() ?? undefined;
+		meta.sessionId = sm.getSessionId?.() ?? undefined;
+		meta.name = sm.getSessionName?.() || undefined;
+		meta.cwd = sm.getCwd?.() || undefined;
+		for (const entry of sm.getEntries?.() ?? []) {
+			if (entry?.type !== "message" || entry.message?.role !== "user") continue;
+			const text = oneLine(textOf(entry.message.content));
+			if (text) {
+				meta.firstPrompt = text;
+				break;
+			}
+		}
+	} catch {
+		// Partial metadata is still useful.
+	}
+	return meta;
+}
+
+function reporter(link: SupervisorLink) {
+	return (pi: ExtensionAPI) => {
+		let running = false;
+		let dialogs = 0;
+		let error: string | undefined;
+		const state = () => (dialogs > 0 ? "waiting" : running ? "working" : "idle");
+		pi.on("session_start", (_event, ctx) => {
+			running = false;
+			dialogs = 0;
+			link.update({ ...sessionMeta(ctx.sessionManager), state: state() });
+		});
+		pi.on("session_info_changed", (event) => link.update({ name: event.name || null }));
+		pi.on("agent_start", () => {
+			running = true;
+			error = undefined;
+			link.update({ state: state(), error: null, lastOutcome: null });
+		});
+		pi.on("message_end", (event, ctx) => {
+			const message: any = event.message;
+			if (message?.role === "assistant" && message.stopReason === "error" && message.errorMessage) {
+				error = String(message.errorMessage);
+			}
+			// pi writes the session file at the first message. Report its path then.
+			if (message?.role === "user") link.update(sessionMeta(ctx.sessionManager));
+		});
+		pi.on("agent_settled", (event) => {
+			running = false;
+			const lastOutcome = event.aborted ? "aborted" : error ? "error" : "done";
+			link.update({ state: state(), lastOutcome, error: error ?? null });
+		});
+		pi.on("ui_prompt_start", () => {
+			dialogs++;
+			link.update({ state: state() });
+		});
+		pi.on("ui_prompt_end", () => {
+			dialogs = Math.max(0, dialogs - 1);
+			link.update({ state: state() });
+		});
 	};
-	// Readers never see a half-written file: write a temp file, then rename it.
-	const temp = `${options.infoFile}.${process.pid}.tmp`;
-	writeFileSync(temp, JSON.stringify(info, null, "\t"), { mode: 0o600 });
-	renameSync(temp, options.infoFile);
+}
+
+// ---------------------------------------------------------------------------
+// SupervisorLink: the control connection of the worker. It reconnects when the
+// supervisor restarts, and ends the worker after a minute without one.
+
+class SupervisorLink {
+	private connection?: Connection;
+	/** Everything reported so far. A new connection receives it with the hello. */
+	private snapshot: WorkerUpdate = {};
+	private lostSince = Date.now();
+	private retry?: ReturnType<typeof setTimeout>;
+	private readonly options: WorkerOptions;
+	private readonly log: Log;
+	private readonly actions: { stop: () => void; orphan: () => void };
+
+	constructor(options: WorkerOptions, log: Log, actions: { stop: () => void; orphan: () => void }) {
+		this.options = options;
+		this.log = log;
+		this.actions = actions;
+	}
+
+	start(): void {
+		void this.connect();
+	}
+
+	update(patch: WorkerUpdate): void {
+		Object.assign(this.snapshot, patch);
+		this.connection?.send({ type: "worker.update", update: patch });
+	}
+
+	private async connect(): Promise<void> {
+		let connection: Connection;
+		try {
+			connection = await connect(this.options.supervisor);
+		} catch {
+			this.scheduleRetry();
+			return;
+		}
+		connection.onMessage((message): ReplyData => {
+			if (message.type !== "stop") throw new Error(`Unknown request "${message.type}".`);
+			setImmediate(() => this.actions.stop());
+			return {};
+		});
+		connection.socket.on("close", () => {
+			if (this.connection !== connection) return;
+			this.connection = undefined;
+			this.lostSince = Date.now();
+			this.log("lost the supervisor. Reconnecting.");
+			this.scheduleRetry();
+		});
+		try {
+			await connection.request(
+				{
+					type: "worker.hello",
+					workerId: this.options.id,
+					pid: process.pid,
+					socket: this.options.socket,
+					update: this.snapshot,
+				},
+				10_000,
+			);
+		} catch (error) {
+			// The supervisor answered, but does not know this session. Nobody can reach it.
+			this.log("supervisor refused the worker:", error);
+			connection.close();
+			if (!connection.isClosed) this.actions.orphan();
+			else this.scheduleRetry();
+			return;
+		}
+		this.connection = connection;
+		this.log("connected to the supervisor");
+	}
+
+	private scheduleRetry(): void {
+		if (this.retry) return;
+		if (Date.now() - this.lostSince > ORPHAN_AFTER_MS) {
+			this.log("no supervisor for a minute. Ending.");
+			this.actions.orphan();
+			return;
+		}
+		this.retry = setTimeout(() => {
+			this.retry = undefined;
+			void this.connect();
+		}, RECONNECT_MS);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +320,7 @@ function writeInfo(options: WorkerOptions, runtime: any): void {
 
 class Attachments {
 	private current?: net.Socket;
+	private stopping = false;
 	private readonly mode: any;
 	private readonly terminal: SocketTerminal;
 	private readonly log: Log;
@@ -159,13 +335,22 @@ class Attachments {
 		return this.mode.ui;
 	}
 
-	/** /quit, ctrl+d, and ctrl+c twice detach the client. SIGTERM still runs the real shutdown. */
+	/** /quit, ctrl+d, and ctrl+c twice detach the client. A stop and SIGTERM run the real shutdown. */
 	patchShutdown(): void {
 		const original = this.mode.shutdown.bind(this.mode);
 		this.mode.shutdown = async (options?: { fromSignal?: boolean }) => {
-			if (options?.fromSignal) return original(options);
+			if (options?.fromSignal || this.stopping) return original(options);
 			this.detach("quit");
 		};
+	}
+
+	/** End the session: give the terminal back, then let pi shut down and exit. */
+	stop(reason: DetachReason, message?: string): void {
+		if (this.stopping) return;
+		this.log(`stopping${message ? `: ${message}` : ""}`);
+		this.detach(reason, message);
+		this.stopping = true;
+		void this.mode.shutdown();
 	}
 
 	parkUi(): void {
@@ -192,7 +377,7 @@ class Attachments {
 			for (const frame of frames) {
 				if (!hello) {
 					const message = frame.type === FrameType.hello ? parseJson<AttachHello>(frame) : undefined;
-					if (!message) {
+					if (!message || this.stopping) {
 						socket.destroy();
 						return;
 					}
@@ -257,7 +442,6 @@ class Attachments {
 		}
 		this.log("client closed the connection");
 	}
-
 }
 
 function sizeOf(size: TerminalSize): TerminalSize {
@@ -265,9 +449,6 @@ function sizeOf(size: TerminalSize): TerminalSize {
 	const rows = Number.isFinite(size.rows) && size.rows > 0 ? Math.floor(size.rows) : 24;
 	return { columns, rows };
 }
-
-// ---------------------------------------------------------------------------
-// Socket and log
 
 function listen(socketPath: string, onConnection: (socket: net.Socket) => void): Promise<net.Server> {
 	mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
@@ -280,25 +461,4 @@ function listen(socketPath: string, onConnection: (socket: net.Socket) => void):
 			resolve(server);
 		});
 	});
-}
-
-type Log = (...values: unknown[]) => void;
-
-function openLog(file: string): Log {
-	mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-	return (...values: unknown[]) => {
-		try {
-			appendFileSync(file, `${new Date().toISOString()} ${format(...values)}\n`);
-		} catch {
-			// The log is best effort.
-		}
-	};
-}
-
-/** The worker has no terminal. Text that pi or extensions print goes to the log instead. */
-function routeConsoleToLog(log: Log): void {
-	console.log = (...values: unknown[]) => log(...values);
-	console.info = (...values: unknown[]) => log(...values);
-	console.warn = (...values: unknown[]) => log("warn:", ...values);
-	console.error = (...values: unknown[]) => log("error:", ...values);
 }

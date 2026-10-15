@@ -262,6 +262,7 @@ The supervisor removes the record. The session file stays.
 | A worker stays `idle` and unattached for `idleMinutes` (default 60) | The supervisor stops the worker. The record becomes `saved`. Pinned sessions stay. |
 | A worker exits with code ≠ 0 while `working` | The supervisor restarts it from the session file once. A second crash within 10 minutes makes it `failed`. |
 | A worker exits with code ≠ 0 while `idle` | The record becomes `saved`. |
+| A worker ends before the first message | The supervisor removes the record. pi wrote no session file, so nothing can come back. |
 | The supervisor dies | Each worker keeps running. It retries the supervisor socket every 2 seconds for 60 seconds, then exits. |
 | The machine reboots | Records with a dead `pid` become `failed` if they were `working`, otherwise `saved`. |
 
@@ -272,10 +273,12 @@ The worker sends no initial message on a restart.
 
 ### 8.1 Entry point
 
-The worker starts as `node worker-boot.mjs --pi-dir <dir> --id <id> --socket <path> --info <path> --log <path> --cwd <dir>`.
-`--session <file>` and `--task <text>` are optional.
+The supervisor starts a worker as
+`node boot.mjs worker --pi-dir <dir> --id <id> --supervisor <path> --socket <path> --log <path> --cwd <dir>`.
+`--session <file>`, `--task <text>`, and `--name <name>` are optional.
+`boot.mjs supervisor` and `boot.mjs cli` start the other two roles. `bin/pi-sm.mjs` runs the CLI role.
 
-`worker-boot.mjs` is plain JavaScript. Node refuses to strip types from `.ts` files under `node_modules`,
+`boot.mjs` is plain JavaScript. Node refuses to strip types from `.ts` files under `node_modules`,
 where pi installs packages (Q1).
 The bootstrap imports pi natively from `--pi-dir`: `dist/index.js` and its copy of pi-tui.
 It then loads `worker.ts` through the jiti that pi ships, and passes pi in.
@@ -355,17 +358,21 @@ Readers split records only on `\n`. They do not use `readline`.
 
 ### 10.1 Client and supervisor
 
-| Request | Answer |
-| --- | --- |
-| `hello { version }` | `hello { version, pid }` |
-| `list { all? }` | `sessions [record…]` |
-| `subscribe` | A stream of `changed { record }` and `removed { id }` |
-| `create { … }` | `created { record }` |
-| `attach { id }` | `attach { socket }` |
-| `send { id, text }` | `ok`. A `saved` session starts first. |
-| `interrupt { id }`, `stop { id }`, `rename { id, name }`, `pin { id, pinned }` | `ok` |
-| `transcript { id, max }`, `stats { id }` | Data for the preview and detail screen |
-| `shutdown { keepWorkers }` | `ok` |
+A request carries a numeric `id`. Its answer is `{ type: "response", id, ok, data?, error? }` (`control.ts`).
+In M1, `<session>` is an id, a name, an id prefix, or the start of a name or first prompt.
+
+| Request | Answer data | Since |
+| --- | --- | --- |
+| `hello { version }` | `{ version, pid }` | M1 |
+| `list` | `{ sessions: [record…] }` | M1 |
+| `create { request: { cwd, task?, name?, sessionFile?, env, piDir } }` | `{ record }` after the worker connects. A `sessionFile` that a listed session uses returns that session. | M1 |
+| `attach { session }` | `{ id, socket }`. A `saved` or `failed` session starts first. | M1 |
+| `stop { session }` | `{}` after the worker exits | M1 |
+| `shutdown { keepWorkers }` | `{}`, then the supervisor exits | M1 |
+| `subscribe` | A stream of `changed { record }` and `removed { id }` | |
+| `send { id, text }` | `ok`. A `saved` session starts first. | |
+| `interrupt { id }`, `rename { id, name }`, `pin { id, pinned }` | `ok` | |
+| `transcript { id, max }`, `stats { id }` | Data for the preview and detail screen | |
 
 The supervisor reads transcript and stats of `saved` rows from the session file.
 For live rows it asks the worker.
@@ -388,9 +395,15 @@ This keeps the `⏎` key of the overlay working inside an attached session.
 
 ### 10.3 Worker and supervisor
 
-The worker connects to `supervisor.sock` with `worker.hello { id, pid, socket }`.
-Then it sends events (§8.5) and lock requests (§9).
-The supervisor sends `stop` and `query` requests on the same connection.
+The worker connects to `supervisor.sock` with `worker.hello { workerId, pid, socket, update }`.
+`update` holds everything the worker reported so far, so a new supervisor gets the full state.
+Then the worker sends `worker.update { update }` for each change (§8.5), and later lock requests (§9).
+In an update, `null` clears a field, because JSON drops `undefined`.
+The supervisor sends `stop` on the same connection. The worker answers, detaches its client with reason `stopped`, and runs the shutdown of pi.
+
+An inline extension in the worker produces the updates.
+The worker passes it to pi through `resourceLoaderOptions.extensionFactories`, so it survives `/new` and `/resume`.
+pi lists it as `<inline:1>` in the startup resources.
 
 ## 11. Changes to existing modules
 
@@ -403,7 +416,7 @@ The supervisor sends `stop` and `query` requests on the same connection.
 | `locks.ts` | No change. It runs in the supervisor. |
 | `pickers.ts` | No change. `r` and `o` send `create` with a session file or cwd. |
 | `keys.ts` | No change. The client handles the macOS `ß` key, because the worker has no keyboard. |
-| New `supervisor.ts`, `worker.ts`, `socket-terminal.ts`, `protocol.ts`, `client.ts`, `bin/pi-sm.ts` | See §5 to §10. |
+| New `supervisor.ts`, `supervisor-client.ts`, `registry.ts`, `control.ts`, `env.ts`, `paths.ts`, `filelog.ts`, `worker.ts`, `socket-terminal.ts`, `protocol.ts`, `client.ts`, `cli.ts`, `boot.mjs`, `bin/pi-sm.mjs` | See §5 to §10. |
 
 ### 11.1 Migration
 
@@ -453,7 +466,7 @@ The plain pi process then attaches to that worker.
 | Q3 | Does any pi code write to `process.stdout` outside the `Terminal`? | Answered (§8.4). |
 | Q4 | Do extensions with a global state break when each session gets its own process? This mostly helps them. | Test with the extensions of the user in M2. |
 | Q5 | Should the record keep the full client `env`, or only an allow list? It may hold secrets. | Answered: an allow list with user additions (§6.3). |
-| Q6 | Does a second pi process that opens a session file of a live worker corrupt it? | Test in M1. If yes, the extension routes `--resume` of a live session to attach, as Claude Code does. |
+| Q6 | Does a second pi process that opens a session file of a live worker corrupt it? | Answered in M1: no byte damage, but the conversation forks. Each process appends its own entries and never sees the other's. `create` returns the listed session for a known file. M4 routes `--resume` of a live session to attach, as Claude Code does. |
 | Q7 | Can the client run the external editor (`ctrl+g`) for a worker and send the text back? | After M7. |
 | Q8 | pi-tui detects terminal capabilities, such as images, from the environment at startup. A worker keeps the values of the terminal that started it. Should `hello` override them for each client? | Before M3. `hello` already carries `term`, `colorterm`, and `termProgram`. |
 | Q9 | `SocketTerminal` skips the OSC 7501 program status. Is it needed? | After M7. |
@@ -470,8 +483,9 @@ The plain pi process then attaches to that worker.
 
 ### M0: done on 2026-10-15
 
-The spike adds `protocol.ts`, `socket-terminal.ts`, `worker.ts`, `worker-boot.mjs`, `client.ts`, and `dev/m0.ts`.
-`dev/m0.ts` starts, attaches, lists, and stops workers without a supervisor.
+The spike added `protocol.ts`, `socket-terminal.ts`, `worker.ts`, `worker-boot.mjs`, `client.ts`, and `dev/m0.ts`.
+`dev/m0.ts` started, attached, listed, and stopped workers without a supervisor.
+M1 replaced `worker-boot.mjs` with `boot.mjs`, and `dev/m0.ts` with `pi-sm`.
 
 A manual run in a PTY on Linux with pi 1.1.0 showed these results:
 
@@ -485,3 +499,41 @@ A manual run in a PTY on Linux with pi 1.1.0 showed these results:
 
 Unit tests cover the frame protocol and the keyboard negotiation of `SocketTerminal`.
 A PTY test in CI is still open (§12).
+
+### M1: done on 2026-10-15
+
+M1 adds the supervisor and the `pi-sm` CLI:
+
+| File | Job |
+| --- | --- |
+| `supervisor.ts` | Records, worker spawn and stop, crash and reboot rules of §7.6, single instance per agent dir |
+| `supervisor-client.ts` | Connects to the supervisor. Starts it under `supervisor.lock` when none runs. |
+| `registry.ts` | `sessions/<id>.json` with temp file and rename, mode `0600` |
+| `control.ts` | JSONL records, requests and responses |
+| `env.ts` | The allow list of §6.3 |
+| `paths.ts` | State paths, and the short socket folder for deep agent dirs |
+| `cli.ts`, `bin/pi-sm.mjs` | `list`, `new`, `attach`, `stop`, `daemon status`, `daemon stop` |
+| `boot.mjs` | Starts the worker, supervisor, and CLI roles through pi's jiti |
+
+The worker now reports its state over the control connection, reconnects every 2 seconds, and ends after 60 seconds without a supervisor.
+The worker info file of M0 is gone. The record replaces it.
+
+A manual run on Linux with pi 1.1.0 showed these results, with a throwaway agent dir and with the real one:
+
+- `pi-sm new --bg` from two folders starts two sessions in about 1 to 2 seconds each. `pi-sm list` shows both.
+- The record holds only allowed variables. The agent dir reaches the worker through the supervisor environment.
+- `pi-sm attach alpha` attaches by name. `ctrl+d` detaches. The session keeps running.
+- `pi-sm daemon stop --keep-workers` stops the supervisor. The next command starts a new one, and both workers reconnect within 2 seconds.
+- `kill -9` on an idle worker makes its session `saved`. Without a session file, the session leaves the list.
+- `pi-sm attach` on a `saved` session starts a worker on its file. The old message shows on screen.
+- `pi-sm new --session` on a file that a listed session uses returns that session.
+- `pi-sm daemon stop` ends all workers, keeps sessions with a file as `saved`, and leaves no process or socket behind.
+
+Unit tests cover the supervisor with a fake worker, the control channel, the registry, the allow list, and the socket paths.
+
+Parts of §7 and §10 that M1 leaves for later milestones:
+
+- The takeover of a held session by a second client (§7.3) works in the worker, but no test covers it yet. M2.
+- A version mismatch only prints a warning. The restart of §7.1 comes in M6.
+- Idle reaping, crash restart, and pins come in M6.
+- The old in-process extension (`index.ts`) still loads in every worker if the user installs it. M3 gives it a worker mode.
