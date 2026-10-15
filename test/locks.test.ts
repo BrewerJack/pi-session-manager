@@ -1,12 +1,19 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { canonicalPath, inferToolPaths, LockManager, pathsConflict } from "../locks.ts";
 
+const created: string[] = [];
+after(() => {
+	for (const dir of created) rmSync(dir, { recursive: true, force: true });
+});
+
 function workspace(): string {
-	return realpathSync(mkdtempSync(path.join(tmpdir(), "psm-locks-")));
+	const dir = realpathSync(mkdtempSync(path.join(tmpdir(), "psm-locks-")));
+	created.push(dir);
+	return dir;
 }
 
 test("paths conflict when one contains the other", () => {

@@ -26,13 +26,14 @@ export interface AttachStreams {
 	output: NodeJS.WriteStream;
 	/** Drops the connection without a detach, as a closed terminal does. */
 	signal?: AbortSignal;
+	/** Changes input before it goes to the worker, such as the macOS Option key. */
+	translate?: (data: string) => string;
 }
 
-export function attach(
-	socketPath: string,
-	streams: AttachStreams = { input: process.stdin, output: process.stdout },
-): Promise<AttachResult> {
-	const { input, output, signal } = streams;
+const STANDARD_STREAMS: AttachStreams = { input: process.stdin, output: process.stdout };
+
+export function attach(socketPath: string, streams: AttachStreams = STANDARD_STREAMS): Promise<AttachResult> {
+	const { input, output, signal, translate } = streams;
 	return new Promise((resolve) => {
 		const socket = net.connect(socketPath);
 		const abort = () => socket.destroy();
@@ -44,7 +45,9 @@ export function attach(
 		let started = false;
 
 		const onInput = (chunk: Buffer | string) => {
-			if (!socket.destroyed) socket.write(encodeFrame(FrameType.data, Buffer.from(chunk)));
+			if (socket.destroyed) return;
+			const data = translate ? Buffer.from(translate(chunk.toString())) : Buffer.from(chunk);
+			socket.write(encodeFrame(FrameType.data, data));
 		};
 		const onResize = () => {
 			socket.write(encodeJsonFrame(FrameType.resize, { columns: output.columns, rows: output.rows }));

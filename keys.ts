@@ -100,3 +100,44 @@ export function displayKey(key: string, platform: string): string {
 	const mods = parts.sort((a, b) => order.indexOf(a) - order.indexOf(b)).map((m) => symbols[m] ?? m);
 	return mods.join("") + (base.length === 1 ? base.toUpperCase() : base);
 }
+
+/** The part of pi's macOS native helper that the modifier probe needs. */
+interface NativeHelper {
+	isModifierPressed?: (name: string) => unknown;
+}
+
+/**
+ * pi's macOS native helper as a modifier probe. Undefined off macOS, or when pi runs without
+ * the helper, for example over SSH. `getHelper` is getNativeClipboard of pi-tui.
+ */
+export function macModifierProbe(getHelper: () => unknown, platform = process.platform): ModifierProbe | undefined {
+	if (platform !== "darwin") return undefined;
+	let helper: NativeHelper | undefined;
+	try {
+		helper = getHelper() as NativeHelper | undefined;
+	} catch {
+		return undefined;
+	}
+	const probe = helper?.isModifierPressed;
+	if (typeof probe !== "function") return undefined;
+	return (name) => {
+		try {
+			return probe.call(helper, name) === true;
+		} catch {
+			return false;
+		}
+	};
+}
+
+/**
+ * A worker has no keyboard, so the client handles the macOS key (spec §11). The client turns
+ * the Option character into the escape sequence of the alt+letter shortcut. Undefined when
+ * nothing needs a translation.
+ */
+export function macOptionTranslator(config: KeyConfig, pressed: ModifierProbe | undefined): ((data: string) => string) | undefined {
+	const letter = /^alt\+([a-z])$/.exec(config.shortcut)?.[1];
+	if (!pressed || !letter || !config.macOptionChars.length) return undefined;
+	const sequence = `\x1b${letter}`;
+	return (data) => (isMacOptionShortcut(data, config.macOptionChars, pressed) ? sequence : data);
+}
+

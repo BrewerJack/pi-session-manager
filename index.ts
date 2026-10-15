@@ -19,7 +19,14 @@ import { getNativeClipboard, type KeyId, type OverlayOptions } from "@earendil-w
 import { attachLoop, describeEnd } from "./client.ts";
 import type { Inheritance } from "./control.ts";
 import { formatBreakdown, type FooterEntry } from "./footer.ts";
-import { displayKey, isMacOptionShortcut, loadKeyConfig, type KeyConfig, type ModifierProbe } from "./keys.ts";
+import {
+	displayKey,
+	isMacOptionShortcut,
+	loadKeyConfig,
+	macModifierProbe,
+	macOptionTranslator,
+	type KeyConfig,
+} from "./keys.ts";
 import { blockReason, inferToolPaths } from "./locks.ts";
 import { debug } from "./log.ts";
 import { statePaths, type BootContext } from "./paths.ts";
@@ -47,6 +54,8 @@ let SHORTCUT = displayKey(KEYS.shortcut, process.platform);
 const WIDGET_KEY = "pi-session-manager";
 const FOOTER_KEY = "pi-session-manager";
 const SOURCE_KEY = Symbol.for("pi-session-manager.source");
+/** The custom entry in which versions 0.1.0 to 0.3.0 listed the child sessions of a main session. */
+const CHILDREN_ENTRY = "pi-session-manager.children";
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const SUBCOMMANDS: [string, string][] = [
 	["new", "Start a session. With a task, it runs in the background."],
@@ -122,7 +131,8 @@ export default function sessionManager(pi: ExtensionAPI) {
 	pi.on("session_start", (event, ctx) => {
 		if (ctx.mode !== "tui") return;
 		installSessionUi(self, ctx);
-		if (!workerBridge()) routeAtStart(self, event.reason, ctx);
+		if (workerBridge()) return;
+		if (!routeAtStart(self, event.reason, ctx) && event.reason !== "reload") importOldChildren(self, ctx);
 	});
 
 	// A worker takes its locks in its own inline extension. Plain pi takes them here (spec §9).
@@ -250,33 +260,13 @@ function watchOthers(source: SessionSource, ctx: ExtensionContext): () => void {
 	});
 }
 
-/** pi's macOS native helper, or undefined when pi runs elsewhere or without it (for example over SSH). */
-function macModifierProbe(): ModifierProbe | undefined {
-	if (process.platform !== "darwin") return undefined;
-	try {
-		const helper: any = getNativeClipboard();
-		if (typeof helper?.isModifierPressed !== "function") return undefined;
-		return (name) => {
-			try {
-				return helper.isModifierPressed(name) === true;
-			} catch (error) {
-				debug(error);
-				return false;
-			}
-		};
-	} catch (error) {
-		debug(error);
-		return undefined;
-	}
-}
-
 /**
  * Open the manager when a macOS terminal turns Option+S into "ß". Terminals that
  * send alt+s, such as ones with "Option as Meta" turned on, use the normal shortcut.
  */
 function installMacOptionKey(self: Instance, ctx: ExtensionContext): (() => void) | undefined {
 	if (!KEYS.macOptionChars.length) return undefined;
-	const pressed = macModifierProbe();
+	const pressed = macModifierProbe(getNativeClipboard);
 	if (!pressed) return undefined;
 	return ctx.ui.onTerminalInput((data) => {
 		if (self.managerOpen || !isMacOptionShortcut(data, KEYS.macOptionChars, pressed)) return undefined;
@@ -373,7 +363,8 @@ async function attachParked(source: SessionSource, ctx: Ctx, id: string): Promis
 		} catch (error) {
 			debug(error);
 		}
-		attachLoop((next) => source.attach(next), id)
+		const translate = macOptionTranslator(KEYS, macModifierProbe(getNativeClipboard));
+		attachLoop((next) => source.attach(next), id, { input: process.stdin, output: process.stdout, translate })
 			.then(({ result, id: last }) => {
 				const text = describeEnd(result, last, `/sessions open ${source.get(last)?.name ?? last}`);
 				ended = { text, type: result.kind === "error" ? "error" : "info" };
@@ -425,8 +416,8 @@ async function runClientLoop(self: Instance, ctx: ExtensionContext, first?: stri
  * the session file of a listed session (spec Q6). Two processes on one file fork the
  * conversation, so pi must not keep that file for itself.
  */
-function routeAtStart(self: Instance, reason: string, ctx: ExtensionContext): void {
-	if (reason !== "startup" && reason !== "resume") return;
+function routeAtStart(self: Instance, reason: string, ctx: ExtensionContext): boolean {
+	if (reason !== "startup" && reason !== "resume") return false;
 	let file: string | undefined;
 	try {
 		file = ctx.sessionManager.getSessionFile();
@@ -436,7 +427,7 @@ function routeAtStart(self: Instance, reason: string, ctx: ExtensionContext): vo
 	const paths = statePaths(getAgentDir());
 	const listed = file && existsSync(file) ? new Registry(paths.sessions).load().find((r) => r.sessionFile === file) : undefined;
 	const detached = reason === "startup" && readManagerSettings(path.join(getAgentDir(), "settings.json")).startDetached;
-	if (!listed && !detached) return;
+	if (!listed && !detached) return false;
 	const why = listed ? `"${listed.name ?? listed.firstPrompt ?? listed.id}" runs in the background, so pi attached to it.` : undefined;
 	// The TUI starts after session_start. The client loop needs it.
 	setTimeout(() => {
@@ -445,6 +436,35 @@ function routeAtStart(self: Instance, reason: string, ctx: ExtensionContext): vo
 			ctx.ui.notify(String(error?.message ?? error), "error");
 		});
 	}, 0);
+	return true;
+}
+
+/**
+ * Versions 0.1.0 to 0.3.0 listed the child sessions of a main session in a custom entry.
+ * Plain pi turns that list into saved sessions once, then records an empty list (spec §11.1).
+ */
+function importOldChildren(self: Instance, ctx: ExtensionContext): void {
+	let files: string[] = [];
+	try {
+		for (const entry of ctx.sessionManager.getBranch()) {
+			const custom = entry as { type?: string; customType?: string; data?: { files?: unknown } };
+			if (custom.type !== "custom" || custom.customType !== CHILDREN_ENTRY) continue;
+			const listed = custom.data?.files;
+			files = Array.isArray(listed) ? listed.filter((f): f is string => typeof f === "string") : [];
+		}
+	} catch (error) {
+		debug(error);
+	}
+	if (!files.length) return;
+	self.source
+		.importSaved(files)
+		.then((rows) => {
+			self.pi.appendEntry(CHILDREN_ENTRY, { files: [], movedToSessionList: rows.map((r) => r.id) });
+			if (!rows.length) return;
+			const what = rows.length === 1 ? "1 saved session" : `${rows.length} saved sessions`;
+			ctx.ui.notify(`Moved ${what} of this main session to the session list. Press ${SHORTCUT} to open one.`, "info");
+		})
+		.catch((error) => debug(error));
 }
 
 /**

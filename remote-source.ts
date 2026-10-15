@@ -190,6 +190,16 @@ export class RemoteSource implements SessionSource {
 		}
 	}
 
+	/** Saved sessions for session files. A file that a listed session uses returns that session. */
+	async importSaved(files: string[]): Promise<Row[]> {
+		const allow = loadEnvAllow(path.join(this.paths.agentDir, "settings.json"));
+		const message = { type: "import", files, piDir: this.context.piDir, env: pickEnv(process.env, allow) };
+		const { records } = await this.request<{ records: Row[] }>(message);
+		for (const row of records) this.rows.set(row.id, row);
+		this.notify();
+		return records;
+	}
+
 	releaseLock(toolCallId: string): void {
 		this.connection?.send({ type: "lock.release", toolCallId });
 	}

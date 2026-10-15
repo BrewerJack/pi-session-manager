@@ -283,6 +283,8 @@ export class Supervisor {
 				return this.transcript(session, Number(message.max) || 120);
 			case "stats":
 				return this.stats(session);
+			case "import":
+				return { records: this.importFiles(message).map(publicRecord) };
 			case "create":
 				return this.create(message.request as CreateRequest).then((record) => ({ record: publicRecord(record) }));
 			case "stop":
@@ -383,6 +385,15 @@ export class Supervisor {
 		if (this.live.get(record.id)?.connection) return this.forward(record, { type: "stats" });
 		if (!record.sessionFile || !existsSync(record.sessionFile)) return { usage: record.usage ?? null };
 		return { usage: { ...usageOf(readSessionFile(record.sessionFile).entries), contextPercent: record.usage?.contextPercent ?? null } };
+	}
+
+	/** Saved sessions for the files that a client lists, such as the child list of 0.3.0 (spec §11.1). */
+	private importFiles(message: Message): SessionRecord[] {
+		const files = Array.isArray(message.files) ? message.files.filter((f): f is string => typeof f === "string") : [];
+		const piDir = String(message.piDir ?? "");
+		if (!piDir) throw new Error("import needs piDir.");
+		const env = message.env && typeof message.env === "object" ? (message.env as Record<string, string>) : {};
+		return files.filter((file) => path.isAbsolute(file) && existsSync(file)).map((file) => this.addSaved(file, piDir, env));
 	}
 
 	/**

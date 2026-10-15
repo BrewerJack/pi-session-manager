@@ -242,6 +242,17 @@ test("a newer client restarts an older supervisor and keeps its workers", { skip
 	}
 });
 
+test("the external editor key shows a notice in a worker", { skip }, async () => {
+	const record = await create("editor");
+	const viewer = client(await socketOf(record.id));
+	await until(() => viewer.screen().includes("editor"), "the screen");
+	viewer.type("\x07");
+	await until(() => viewer.screen().includes("external editor does not work"), "the notice");
+	viewer.type("\x04");
+	assert.equal((await viewer.done).kind, "detached");
+	assert.ok(isAlive(record.pid!));
+});
+
 // This test must stay the last one: it lets the supervisor stop every idle session without a client.
 test("an idle session without a client loses its worker, and an attached one keeps it", { skip }, async () => {
 	const settings = path.join(agentDir, "settings.json");

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import {
 	DEFAULT_SHORTCUT,
 	displayKey,
@@ -13,8 +13,14 @@ import {
 	type ModifierProbe,
 } from "../keys.ts";
 
+const created: string[] = [];
+after(() => {
+	for (const dir of created) rmSync(dir, { recursive: true, force: true });
+});
+
 function settingsFile(content: unknown): string {
 	const dir = mkdtempSync(path.join(tmpdir(), "psm-keys-"));
+	created.push(dir);
 	const file = path.join(dir, "settings.json");
 	writeFileSync(file, typeof content === "string" ? content : JSON.stringify(content));
 	return file;
@@ -90,4 +96,26 @@ test("macOS shows modifier symbols, other platforms keep the key id", () => {
 	assert.equal(displayKey("shift+ctrl+f2", "darwin"), "⌃⇧f2");
 	assert.equal(displayKey("alt+s", "linux"), "alt+s");
 	assert.equal(displayKey("alt+s", "win32"), "alt+s");
+});
+
+test("a client turns the macOS Option character into the alt shortcut while Option is held", async () => {
+	const { loadKeyConfig: load, macOptionTranslator, macModifierProbe } = await import("../keys.ts");
+	const config = load("/nonexistent/settings.json", {});
+	let option = true;
+	const translate = macOptionTranslator(config, (name) => name === "option" && option);
+	assert.ok(translate);
+	assert.equal(translate!("ß"), "\x1bs");
+	assert.equal(translate!("ßß"), "ßß");
+	assert.equal(translate!("a"), "a");
+	option = false;
+	assert.equal(translate!("ß"), "ß");
+	// Without a probe, or with a shortcut other than alt+letter, nothing changes.
+	assert.equal(macOptionTranslator(config, undefined), undefined);
+	assert.equal(macOptionTranslator(load("/nonexistent", { PI_SESSION_MANAGER_SHORTCUT: "ctrl+alt+s" }), () => true), undefined);
+	// The probe exists on macOS only, and only with the native helper of pi.
+	assert.equal(macModifierProbe(() => ({ isModifierPressed: () => true }), "linux"), undefined);
+	assert.equal(macModifierProbe(() => ({}), "darwin"), undefined);
+	const probe = macModifierProbe(() => ({ isModifierPressed: (name: string) => name === "option" }), "darwin");
+	assert.equal(probe?.("option"), true);
+	assert.equal(probe?.("command"), false);
 });

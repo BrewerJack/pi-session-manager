@@ -143,6 +143,27 @@ test("pi on the file of a listed session attaches to it, then ends after the man
 	}
 });
 
+test("a main session of 0.3.0 hands its child list to the session list once", { skip }, async () => {
+	const fixture = readFileSync(path.join(ROOT, "test", "fixtures", "conversation.jsonl"), "utf8").replace('"cwd":"/tmp"', `"cwd":${JSON.stringify(workDir)}`);
+	const child = path.join(workDir, "child.jsonl");
+	writeFileSync(child, fixture);
+	const main = path.join(workDir, "main.jsonl");
+	const entry = { type: "custom", customType: "pi-session-manager.children", data: { files: [child] }, id: "b0000001", parentId: "a0000006", timestamp: "2026-10-15T06:00:05.000Z" };
+	writeFileSync(main, `${fixture}${JSON.stringify(entry)}\n`);
+	const pi = runPi(["--session", main]);
+	try {
+		await pi.wait("Moved 1 saved session");
+		const row = (await sessions()).find((r) => r.sessionFile === child);
+		assert.equal(row?.state, "saved");
+		await pi.type("\x04");
+		assert.equal(await pi.exit, 0);
+		const last = readFileSync(main, "utf8").trim().split("\n").map((line) => JSON.parse(line)).filter((e) => e.customType === "pi-session-manager.children").at(-1);
+		assert.deepEqual(last.data.files, []);
+	} finally {
+		pi.kill();
+	}
+});
+
 test("startDetached opens the manager at once and ends pi with it", { skip }, async () => {
 	writeSettings({ sessionManager: { startDetached: true } });
 	const pi = runPi([]);

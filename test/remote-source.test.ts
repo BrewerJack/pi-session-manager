@@ -127,3 +127,21 @@ test("a send to a saved session starts its worker first", async () => {
 		await supervisor.close(false);
 	}
 });
+
+test("files of an old child list become saved sessions once", async () => {
+	const { dir, source, supervisor } = await setup();
+	try {
+		const file = path.join(dir, "child.jsonl");
+		copyFileSync(CONVERSATION, file);
+		const rows = await source.importSaved([file, path.join(dir, "missing.jsonl"), "relative.jsonl"]);
+		assert.equal(rows.length, 1);
+		assert.equal(rows[0]?.state, "saved");
+		assert.equal(rows[0]?.name, "fixture");
+		const again = await source.importSaved([file]);
+		assert.equal(again[0]?.id, rows[0]?.id);
+		assert.equal(supervisor.list().length, 1);
+	} finally {
+		source.dispose();
+		await supervisor.close(false);
+	}
+});

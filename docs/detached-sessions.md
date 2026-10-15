@@ -1,6 +1,6 @@
 # Detached sessions
 
-Status: draft, 2026-10-14. Target release: 0.4.0, published to npm once M7 is done. No prerelease and no 1.0.0 with it.
+Status: implemented in 0.4.0 on 2026-10-15. Section 16 records the progress of each milestone.
 
 This document specifies how pi-session-manager moves from one process for all sessions
 to a supervisor with one process per session.
@@ -333,7 +333,7 @@ A grep of pi 1.1.0 found these writes that bypass the `Terminal`:
 | `formatResumeCommand` in `shutdown` | Skipped, because stdout is no TTY | None |
 | `console.log` of the model scope in `InteractiveMode.init` | Goes to the worker log | None |
 | `console.log` in `model-resolver.js` | Goes to the worker log | None |
-| `editInExternalEditor` spawns `$EDITOR` with `stdio: "inherit"` | The editor has no terminal | Not supported in M0 to M7. The worker shows a notice. See Q7. |
+| `editInExternalEditor` spawns `$EDITOR` with `stdio: "inherit"` | The editor has no terminal | Not supported in M0 to M7. The worker patches `handleOpenExternalEditor` and shows a notice instead. See Q7. |
 
 ### 8.5 Events to the supervisor
 
@@ -675,4 +675,21 @@ Tests:
 - `test/supervisor.test.ts`: crash restart and the second crash, idle reaping with a client and a pin, the reboot cases,
   and recovery after a SIGKILL of a supervisor in its own process (`test/fixtures/supervisor-process.ts`).
 - `test/e2e.test.ts`: a newer client restarts an older supervisor, and its worker reconnects. Idle reaping with real workers.
+
+### M7: done on 2026-10-15
+
+M7 finishes 0.4.0:
+
+- macOS keys in the client: a worker cannot ask macOS which modifiers the user holds. The attach client asks instead.
+  It turns the Option character of the shortcut, such as `ß`, into `alt+s` before it sends it to the worker.
+  Plain pi and `pi-sm` both do this.
+- Migration (§11.1): plain pi reads the child list of 0.3.0 from its session on `session_start`.
+  The supervisor imports the files as saved sessions with the new `import` request.
+  Then plain pi records an empty list, so the import runs once, and a notice says how many sessions moved.
+- §8.4: the external editor key shows a notice in a worker instead of an editor without a terminal.
+- The README describes the new model: detach and attach, `pi-sm`, the life of a session, the settings,
+  the environment of a session, the files on disk, and the upgrade from 0.3.
+- Version 0.4.0.
+
+A start of plain pi with the real agent dir and all extensions of the user showed no extension error.
 

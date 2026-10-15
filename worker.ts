@@ -145,6 +145,7 @@ export async function runWorker(sdk: Sdk, tui: TuiDeps, options: WorkerOptions):
 	});
 	attachments = new Attachments(mode, terminal, log, run, (patch) => link.update(patch));
 	attachments.patchShutdown();
+	patchExternalEditor(mode, run);
 	publishBridge(options.id, attachments, run);
 
 	const hangupBefore = new Set(process.listeners("SIGHUP"));
@@ -165,6 +166,17 @@ export async function runWorker(sdk: Sdk, tui: TuiDeps, options: WorkerOptions):
 	link.start();
 
 	await mode.run();
+}
+
+/**
+ * The external editor needs the terminal of the client, which a worker does not have (spec §8.4, Q7).
+ * handleOpenExternalEditor is a private member of InteractiveMode. Without it, nothing changes.
+ */
+function patchExternalEditor(mode: any, run: RunState): void {
+	if (typeof mode.handleOpenExternalEditor !== "function") return;
+	mode.handleOpenExternalEditor = async () => {
+		run.ctx?.ui.notify("The external editor does not work in a background session yet. Type here, or paste the text.", "warning");
+	};
 }
 
 // ---------------------------------------------------------------------------

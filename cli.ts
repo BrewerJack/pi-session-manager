@@ -6,6 +6,7 @@ import { parseArgs } from "node:util";
 import { attachLoop, describeEnd } from "./client.ts";
 import type { CreateRequest, SessionRecord } from "./control.ts";
 import { loadEnvAllow, pickEnv } from "./env.ts";
+import { loadKeyConfig, macModifierProbe, macOptionTranslator } from "./keys.ts";
 import { agentDirFrom, statePaths, type BootContext, type StatePaths } from "./paths.ts";
 import { connectSupervisor, isOlder, type SupervisorHandle } from "./supervisor-client.ts";
 
@@ -146,10 +147,26 @@ async function attachCommand(context: BootContext, paths: StatePaths, args: stri
 
 async function attachTo(context: BootContext, paths: StatePaths, target: string): Promise<number> {
 	if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("attach needs a terminal.");
-	const { result, id } = await attachLoop((next) => resolveSocket(context, paths, next), target);
+	const streams = { input: process.stdin, output: process.stdout, translate: await macTranslator(paths.agentDir) };
+	const { result, id } = await attachLoop((next) => resolveSocket(context, paths, next), target, streams);
 	const text = describeEnd(result, id);
 	process.stderr.write(result.kind === "error" ? `pi-sm: ${text}\n` : `${text}\n`);
 	return result.kind === "error" ? 1 : 0;
+}
+
+/**
+ * On macOS, the Option key of the shortcut types a character such as "ß". The client turns it
+ * into the shortcut, because the worker cannot ask macOS about the keyboard (spec §11).
+ */
+export async function macTranslator(agentDir: string): Promise<((data: string) => string) | undefined> {
+	if (process.platform !== "darwin") return undefined;
+	try {
+		const { getNativeClipboard } = await import("@earendil-works/pi-tui");
+		const keys = loadKeyConfig(path.join(agentDir, "settings.json"), process.env);
+		return macOptionTranslator(keys, macModifierProbe(getNativeClipboard));
+	} catch {
+		return undefined;
+	}
 }
 
 /** The worker socket of a session, from a short connection to the supervisor. */
