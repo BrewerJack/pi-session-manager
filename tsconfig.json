@@ -13,6 +13,7 @@
 	},
 	"include": [
 		"*.ts",
-		"test/*.ts"
+		"test/*.ts",
+		"dev/*.ts"
 	]
 }

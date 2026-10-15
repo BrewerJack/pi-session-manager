@@ -228,9 +228,19 @@ The worker sends no initial message on a restart.
 
 ### 8.1 Entry point
 
-`worker.ts` runs as `node worker.ts --id <id>`.
-It imports `@earendil-works/pi-coding-agent` from the same package root as the extension.
-Open question Q1 covers how to start TypeScript under the node of pi.
+The worker starts as `node worker-boot.mjs --pi-dir <dir> --id <id> --socket <path> --info <path> --log <path> --cwd <dir>`.
+`--session <file>` and `--task <text>` are optional.
+
+`worker-boot.mjs` is plain JavaScript. Node refuses to strip types from `.ts` files under `node_modules`,
+where pi installs packages (Q1).
+The bootstrap imports pi natively from `--pi-dir`: `dist/index.js` and its copy of pi-tui.
+It then loads `worker.ts` through the jiti that pi ships, and passes pi in.
+
+`worker.ts` and `socket-terminal.ts` use `import type` only for pi.
+This way the worker, pi, and the extensions share one pi-tui instance.
+That matters, because pi-tui keeps the Kitty protocol state in a module variable.
+
+The client passes `getPackageDir()` of its own pi as `--pi-dir`, so the worker runs the same pi version.
 
 The worker sets `PI_SESSION_MANAGER_WORKER=<id>` before it loads extensions.
 The extension reads this variable to choose worker mode.
@@ -318,14 +328,15 @@ For live rows it asks the worker.
 
 ### 10.2 Client and worker
 
-After `hello`, the connection switches to binary frames:
-`[type: u8][length: u32 BE][payload]`.
+All records are binary frames: `[type: u8][length: u32 BE][payload]` (`protocol.ts`).
+The first frame from the client must be `hello`. The worker closes connections that start otherwise.
 
 | Type | Direction | Payload |
 | --- | --- | --- |
+| `0 hello` | client → worker | `{ version, columns, rows, term?, colorterm?, termProgram? }` as JSON |
 | `1 data` | both | Terminal bytes |
 | `2 resize` | client → worker | `{ columns, rows }` as JSON |
-| `3 detached` | worker → client | `{ reason, next? }` as JSON |
+| `3 detached` | worker → client | `{ reason, message? }` as JSON. `reason` is `quit`, `taken`, `stopped`, or `error`. |
 | `4 switch` | worker → client | `{ id }`. The manager in the worker picked another session. |
 
 On `switch`, the client detaches and attaches to the new session.
@@ -393,13 +404,15 @@ The plain pi process then attaches to that worker.
 
 | # | Question | How to answer |
 | --- | --- | --- |
-| Q1 | How does the worker start TypeScript? Node 24 runs `.ts` directly. pi may load extensions with its own loader. | M0. Try `process.execPath worker.ts`, then the loader of pi. |
+| Q1 | How does the worker start TypeScript? Node 24 runs `.ts` directly. pi may load extensions with its own loader. | Answered in M0 (§8.1). A plain `.mjs` bootstrap loads `worker.ts` through pi's jiti. |
 | Q2 | May a `tool_call` handler return a promise that pi awaits? | Answered: yes. See §9. |
 | Q3 | Does any pi code write to `process.stdout` outside the `Terminal`? | Answered (§8.4). |
 | Q4 | Do extensions with a global state break when each session gets its own process? This mostly helps them. | Test with the extensions of the user in M2. |
 | Q5 | Should the record keep the full client `env`, or only an allow list? It may hold secrets. | Decide before M1. The record has mode `0600` either way. |
 | Q6 | Does a second pi process that opens a session file of a live worker corrupt it? | Test in M1. If yes, the extension routes `--resume` of a live session to attach, as Claude Code does. |
 | Q7 | Can the client run the external editor (`ctrl+g`) for a worker and send the text back? | After M7. |
+| Q8 | pi-tui detects terminal capabilities, such as images, from the environment at startup. A worker keeps the values of the terminal that started it. Should `hello` override them for each client? | Before M3. `hello` already carries `term`, `colorterm`, and `termProgram`. |
+| Q9 | `SocketTerminal` skips the OSC 7501 program status. Is it needed? | After M7. |
 
 ## 15. Risks
 
@@ -408,3 +421,23 @@ The plain pi process then attaches to that worker.
 - The keyboard protocol logic of `SocketTerminal` copies pi-tui. Changes in pi-tui need a port.
 - Each worker loads all extensions and holds its own model runtime. Ten workers use about ten times the memory of one session.
 - A worker restart after a crash can repeat a tool call that had side effects. The restart resumes from the session file and sends no message (§7.6).
+
+## 16. Progress
+
+### M0: done on 2026-10-15
+
+The spike adds `protocol.ts`, `socket-terminal.ts`, `worker.ts`, `worker-boot.mjs`, `client.ts`, and `dev/m0.ts`.
+`dev/m0.ts` starts, attaches, lists, and stops workers without a supervisor.
+
+A manual run in a PTY on Linux with pi 1.1.0 showed these results:
+
+- The worker starts in about 3 seconds with all user extensions.
+- The full TUI of pi draws through the socket. Typed text reaches the editor.
+- The worker survives the loss of its client.
+- A new attach redraws the full screen. The editor keeps its text.
+- A resize to 70 × 20 makes pi render again at the new size.
+- `ctrl+d` on an empty editor detaches with reason `quit`. The worker stays alive.
+- On detach, the client receives bracketed paste off and the Kitty pop before the connection closes.
+
+Unit tests cover the frame protocol and the keyboard negotiation of `SocketTerminal`.
+A PTY test in CI is still open (§12).
