@@ -22,6 +22,7 @@ import {
 } from "./host.ts";
 import { formatBreakdown, type FooterEntry } from "./footer.ts";
 import { displayKey, isMacOptionShortcut, loadKeyConfig, type KeyConfig, type ModifierProbe } from "./keys.ts";
+import type { WorkerBridge } from "./worker.ts";
 import { fmtAgo, fmtCost, fmtDuration, fmtTokens, ManagerView, shortPath, StatusBar, type ManagerResult } from "./ui.ts";
 
 // pi binds ctrl+r to app.session.rename, so the default is alt+s. Settings can change it.
@@ -37,6 +38,7 @@ const SUBCOMMANDS: [string, string][] = [
 	["rename", "Rename the current session"],
 	["stop", "Stop a live child session by name"],
 	["resume", "Open a saved session as a live child"],
+	["detach", "Leave this background session. It keeps running."],
 ];
 
 type Ctx = ExtensionContext | ExtensionCommandContext;
@@ -504,6 +506,20 @@ async function stopCommand(_pi: ExtensionAPI, host: SessionHost, ctx: ExtensionC
 	ctx.ui.notify(`Stopped "${title}".`, "info");
 }
 
+/** The worker that runs this session, when pi runs as a background worker (spec §7.4). */
+function workerBridge(): WorkerBridge | undefined {
+	return (globalThis as Record<symbol, WorkerBridge | undefined>)[Symbol.for("pi-session-manager.worker")];
+}
+
+async function detachCommand(_pi: ExtensionAPI, _host: SessionHost, ctx: ExtensionCommandContext): Promise<void> {
+	const bridge = workerBridge();
+	if (!bridge) {
+		ctx.ui.notify("This session runs in this terminal. Only a background session can detach.", "warning");
+		return;
+	}
+	bridge.detach();
+}
+
 const SUBCOMMAND_HANDLERS: Record<string, SubcommandHandler> = {
 	"": (pi, host, ctx) => openManager(pi, host, ctx),
 	new: newCommand,
@@ -514,6 +530,7 @@ const SUBCOMMAND_HANDLERS: Record<string, SubcommandHandler> = {
 	stop: stopCommand,
 	kill: stopCommand,
 	resume: (pi, host, ctx) => openManager(pi, host, ctx, "resume"),
+	detach: detachCommand,
 };
 
 async function runCommand(pi: ExtensionAPI, host: SessionHost, args: string, ctx: ExtensionCommandContext) {

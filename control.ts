@@ -162,8 +162,11 @@ export class Connection {
 		});
 	}
 
+	/** End the connection. A peer that does not end its side within a second gets cut off. */
 	close(): void {
+		if (this.socket.destroyed) return;
 		this.socket.end();
+		setTimeout(() => this.socket.destroy(), 1000).unref?.();
 	}
 
 	private dispatch(message: Message): void {

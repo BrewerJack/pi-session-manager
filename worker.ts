@@ -8,8 +8,8 @@ import { mkdirSync, rmSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { connect, type Connection, type ReplyData, type WorkerUpdate } from "./control.ts";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { connect, type Connection, type Outcome, type ReplyData, type WorkerUpdate } from "./control.ts";
 import { openLog, routeConsoleToLog, type Log } from "./filelog.ts";
 import {
 	encodeFrame,
@@ -72,6 +72,7 @@ export async function runWorker(sdk: Sdk, tui: TuiDeps, options: WorkerOptions):
 	process.on("SIGHUP", () => log("SIGHUP ignored"));
 	process.on("unhandledRejection", (error) => log("unhandledRejection", error));
 
+	const state = new RunState();
 	let attachments: Attachments | undefined;
 	const link = new SupervisorLink(options, log, {
 		stop: () => attachments?.stop("stopped"),
@@ -82,7 +83,7 @@ export async function runWorker(sdk: Sdk, tui: TuiDeps, options: WorkerOptions):
 	const sessionManager = options.sessionFile
 		? sdk.SessionManager.open(options.sessionFile, undefined, undefined)
 		: sdk.SessionManager.create(options.cwd, undefined, {});
-	const runtime = await sdk.createAgentSessionRuntime(createRuntimeFactory(sdk, reporter(link)), {
+	const runtime = await sdk.createAgentSessionRuntime(createRuntimeFactory(sdk, reporter(link, state)), {
 		cwd: sessionManager.getCwd?.() || options.cwd,
 		agentDir,
 		sessionManager,
@@ -101,10 +102,16 @@ export async function runWorker(sdk: Sdk, tui: TuiDeps, options: WorkerOptions):
 		initialMessages: [],
 		terminal,
 	});
-	attachments = new Attachments(mode, terminal, log);
+	attachments = new Attachments(mode, terminal, log, state);
 	attachments.patchShutdown();
+	publishBridge(options.id, attachments);
 
+	const hangupBefore = new Set(process.listeners("SIGHUP"));
 	await mode.init();
+	// pi shuts down on SIGHUP. A worker has no terminal to lose, so it keeps running (spec §8.3).
+	for (const listener of process.listeners("SIGHUP")) {
+		if (!hangupBefore.has(listener)) process.off("SIGHUP", listener);
+	}
 	// No client holds the session yet. Stop the TUI so it does not render for nobody.
 	attachments.parkUi();
 
@@ -188,45 +195,109 @@ function sessionMeta(sm: any): WorkerUpdate {
 	return meta;
 }
 
-function reporter(link: SupervisorLink) {
+/** What the worker knows about the current run. The reporter writes it, the attach recap reads it. */
+export class RunState {
+	/** The context of the current session, for notices. */
+	ctx?: ExtensionContext;
+	running = false;
+	runStartedAt?: number;
+	settledAt?: number;
+	lastRunMs?: number;
+	lastOutcome?: Outcome;
+	error?: string;
+	dialogs = 0;
+}
+
+function reporter(link: SupervisorLink, run: RunState) {
 	return (pi: ExtensionAPI) => {
-		let running = false;
-		let dialogs = 0;
-		let error: string | undefined;
-		const state = () => (dialogs > 0 ? "waiting" : running ? "working" : "idle");
+		const state = () => (run.dialogs > 0 ? "waiting" : run.running ? "working" : "idle");
 		pi.on("session_start", (_event, ctx) => {
-			running = false;
-			dialogs = 0;
+			run.ctx = ctx;
+			run.running = false;
+			run.dialogs = 0;
 			link.update({ ...sessionMeta(ctx.sessionManager), state: state() });
 		});
 		pi.on("session_info_changed", (event) => link.update({ name: event.name || null }));
 		pi.on("agent_start", () => {
-			running = true;
-			error = undefined;
+			run.running = true;
+			run.runStartedAt = Date.now();
+			run.error = undefined;
 			link.update({ state: state(), error: null, lastOutcome: null });
 		});
 		pi.on("message_end", (event, ctx) => {
 			const message: any = event.message;
 			if (message?.role === "assistant" && message.stopReason === "error" && message.errorMessage) {
-				error = String(message.errorMessage);
+				run.error = String(message.errorMessage);
 			}
 			// pi writes the session file at the first message. Report its path then.
 			if (message?.role === "user") link.update(sessionMeta(ctx.sessionManager));
 		});
 		pi.on("agent_settled", (event) => {
-			running = false;
-			const lastOutcome = event.aborted ? "aborted" : error ? "error" : "done";
-			link.update({ state: state(), lastOutcome, error: error ?? null });
+			const now = Date.now();
+			run.running = false;
+			run.settledAt = now;
+			run.lastRunMs = run.runStartedAt ? now - run.runStartedAt : undefined;
+			run.lastOutcome = event.aborted ? "aborted" : run.error ? "error" : "done";
+			link.update({ state: state(), lastOutcome: run.lastOutcome, error: run.error ?? null });
 		});
 		pi.on("ui_prompt_start", () => {
-			dialogs++;
+			run.dialogs++;
 			link.update({ state: state() });
 		});
 		pi.on("ui_prompt_end", () => {
-			dialogs = Math.max(0, dialogs - 1);
+			run.dialogs = Math.max(0, run.dialogs - 1);
 			link.update({ state: state() });
 		});
 	};
+}
+
+function fmtSpan(ms: number): string {
+	const sec = Math.max(0, Math.floor(ms / 1000));
+	if (sec < 60) return `${sec}s`;
+	const min = Math.floor(sec / 60);
+	if (min < 60) return `${min}m`;
+	const hour = Math.floor(min / 60);
+	if (hour < 24) return `${hour}h ${min % 60}m`;
+	return `${Math.floor(hour / 24)}d`;
+}
+
+/**
+ * One line for a client that attaches: the last outcome, and the time since the user last
+ * looked (spec §7.3). Nothing when nothing happened since then.
+ */
+export function recap(run: RunState, lastSeenAt: number | undefined, now = Date.now()): { text: string; type: "info" | "warning" | "error" } | undefined {
+	const looked = lastSeenAt ? ` You last looked ${fmtSpan(now - lastSeenAt)} ago.` : "";
+	if (run.dialogs > 0) return { text: `? This session waits for your input.${looked}`, type: "warning" };
+	if (run.running) {
+		const since = run.runStartedAt ? ` for ${fmtSpan(now - run.runStartedAt)}` : "";
+		return lastSeenAt ? { text: `Still working${since}.${looked}`, type: "info" } : undefined;
+	}
+	if (!run.lastOutcome || !run.settledAt || (lastSeenAt && run.settledAt <= lastSeenAt)) return undefined;
+	const ago = `${fmtSpan(now - run.settledAt)} ago`;
+	const took = run.lastRunMs ? ` after ${fmtSpan(run.lastRunMs)}` : "";
+	if (run.lastOutcome === "error") return { text: `✗ Failed ${ago}: ${run.error ?? "error"}.${looked}`, type: "error" };
+	if (run.lastOutcome === "aborted") return { text: `■ Interrupted ${ago}.${looked}`, type: "warning" };
+	return { text: `✓ Done ${ago}${took}.${looked}`, type: "info" };
+}
+
+/** The extension of this package reaches the worker through this object (spec §7.4). */
+export interface WorkerBridge {
+	id: string;
+	/** Detach the client that holds this session. */
+	detach(): void;
+	/** Detach the client and tell it to attach to another session. */
+	switchTo(id: string): void;
+}
+
+export const WORKER_BRIDGE_KEY = Symbol.for("pi-session-manager.worker");
+
+function publishBridge(id: string, attachments: Attachments): void {
+	const bridge: WorkerBridge = {
+		id,
+		detach: () => attachments.detach("quit"),
+		switchTo: (target) => attachments.switchTo(target),
+	};
+	(globalThis as Record<symbol, unknown>)[WORKER_BRIDGE_KEY] = bridge;
 }
 
 // ---------------------------------------------------------------------------
@@ -321,22 +392,33 @@ class SupervisorLink {
 class Attachments {
 	private current?: net.Socket;
 	private stopping = false;
+	/** When a client last let go of the session. */
+	private lastSeenAt?: number;
 	private readonly mode: any;
 	private readonly terminal: SocketTerminal;
 	private readonly log: Log;
+	private readonly run: RunState;
 
-	constructor(mode: any, terminal: SocketTerminal, log: Log) {
+	constructor(mode: any, terminal: SocketTerminal, log: Log, run: RunState) {
 		this.mode = mode;
 		this.terminal = terminal;
 		this.log = log;
+		this.run = run;
 	}
 
 	private get ui(): any {
 		return this.mode.ui;
 	}
 
-	/** /quit, ctrl+d, and ctrl+c twice detach the client. A stop and SIGTERM run the real shutdown. */
+	/**
+	 * /quit, ctrl+d, and ctrl+c twice detach the client. A stop and SIGTERM run the real shutdown.
+	 * shutdown is a private member of InteractiveMode. Without it, /quit ends the worker (spec §8.3).
+	 */
 	patchShutdown(): void {
+		if (typeof this.mode.shutdown !== "function") {
+			this.log("warning: InteractiveMode has no shutdown(). /quit ends this session.");
+			return;
+		}
 		const original = this.mode.shutdown.bind(this.mode);
 		this.mode.shutdown = async (options?: { fromSignal?: boolean }) => {
 			if (options?.fromSignal || this.stopping) return original(options);
@@ -413,6 +495,25 @@ class Attachments {
 		this.ui.start();
 		this.ui.requestRender(true);
 		this.log(`client attached (${hello.columns}x${hello.rows})`);
+		this.postRecap();
+	}
+
+	private postRecap(): void {
+		const line = recap(this.run, this.lastSeenAt);
+		if (!line) return;
+		try {
+			this.run.ctx?.ui.notify(line.text, line.type);
+		} catch (error) {
+			this.log("recap failed", error);
+		}
+	}
+
+	/** The manager in this worker picked another session. The client attaches there next. */
+	switchTo(id: string): void {
+		const socket = this.current;
+		if (!socket) return;
+		if (!socket.destroyed) socket.write(encodeJsonFrame(FrameType.switch, { id }));
+		this.detach("quit");
 	}
 
 	/** Restore the client terminal, tell the client why, and close the connection. */
@@ -427,6 +528,7 @@ class Attachments {
 		const detached: Detached = message ? { reason, message } : { reason };
 		if (!socket.destroyed) socket.end(encodeJsonFrame(FrameType.detached, detached));
 		this.current = undefined;
+		this.lastSeenAt = Date.now();
 		this.terminal.detach();
 		this.log(`client detached: ${reason}`);
 	}
@@ -434,6 +536,7 @@ class Attachments {
 	/** The client went away. It took its terminal along, so nothing needs a restore. */
 	private release(): void {
 		this.current = undefined;
+		this.lastSeenAt = Date.now();
 		this.terminal.detach();
 		try {
 			this.ui.stop();

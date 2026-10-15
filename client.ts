@@ -24,15 +24,20 @@ const TERMINAL_RESET = "\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b[?2031l\x1b[?25h\r\n";
 export interface AttachStreams {
 	input: NodeJS.ReadStream;
 	output: NodeJS.WriteStream;
+	/** Drops the connection without a detach, as a closed terminal does. */
+	signal?: AbortSignal;
 }
 
 export function attach(
 	socketPath: string,
 	streams: AttachStreams = { input: process.stdin, output: process.stdout },
 ): Promise<AttachResult> {
-	const { input, output } = streams;
+	const { input, output, signal } = streams;
 	return new Promise((resolve) => {
 		const socket = net.connect(socketPath);
+		const abort = () => socket.destroy();
+		if (signal?.aborted) abort();
+		signal?.addEventListener("abort", abort, { once: true });
 		const decoder = new FrameDecoder();
 		const wasRaw = input.isRaw ?? false;
 		let result: AttachResult | undefined;
@@ -45,6 +50,7 @@ export function attach(
 			socket.write(encodeJsonFrame(FrameType.resize, { columns: output.columns, rows: output.rows }));
 		};
 		const finish = (fallback: AttachResult) => {
+			signal?.removeEventListener("abort", abort);
 			if (started) {
 				input.off("data", onInput);
 				output.off("resize", onResize);
@@ -86,7 +92,10 @@ export function attach(
 				if (frame.type === FrameType.data) {
 					output.write(frame.payload);
 				} else if (frame.type === FrameType.detached) {
-					result = { kind: "detached", detached: parseJson<Detached>(frame) ?? { reason: "error" } };
+					// A switch comes with a detach. The switch wins.
+					if (result?.kind !== "switch") {
+						result = { kind: "detached", detached: parseJson<Detached>(frame) ?? { reason: "error" } };
+					}
 				} else if (frame.type === FrameType.switch) {
 					const target = parseJson<{ id: string }>(frame);
 					if (target?.id) result = { kind: "switch", id: target.id };

@@ -40,11 +40,16 @@ export async function boot(role, piDir, argv) {
 	const requireFromPi = createRequire(path.join(piDir, "package.json"));
 	const importFromPi = (specifier) => import(pathToFileURL(requireFromPi.resolve(specifier)).href);
 	const { createJiti } = await importFromPi("jiti");
-	const jiti = createJiti(import.meta.url);
+	// Imports of pi and pi-tui in this package get the copies that pi uses itself, as in pi's extension loader.
+	const sdkFile = path.join(piDir, "dist/index.js");
+	const tuiFile = requireFromPi.resolve("@earendil-works/pi-tui");
+	const jiti = createJiti(import.meta.url, {
+		alias: { "@earendil-works/pi-coding-agent": sdkFile, "@earendil-works/pi-tui": tuiFile },
+	});
 	const context = { piDir, root: ROOT, version: readJson(path.join(ROOT, "package.json"))?.version ?? "0.0.0" };
 
 	if (role === "worker") {
-		const sdk = await import(pathToFileURL(path.join(piDir, "dist/index.js")).href);
+		const sdk = await import(pathToFileURL(sdkFile).href);
 		const tui = await importFromPi("@earendil-works/pi-tui");
 		const worker = await jiti.import(path.join(ROOT, "worker.ts"));
 		const deps = { StdinBuffer: tui.StdinBuffer, setKittyProtocolActive: tui.setKittyProtocolActive };

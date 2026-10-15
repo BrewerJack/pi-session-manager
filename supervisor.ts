@@ -73,6 +73,8 @@ export class Supervisor {
 	private readonly registry: Registry;
 	private readonly records = new Map<string, SessionRecord>();
 	private readonly live = new Map<string, Live>();
+	/** Every open connection, so close() does not wait for clients that stay connected. */
+	private readonly connections = new Set<Connection>();
 	private server?: net.Server;
 	private sweepTimer?: ReturnType<typeof setInterval>;
 
@@ -127,8 +129,9 @@ export class Supervisor {
 			await Promise.all(running.map((r) => this.endWorker(r, "keep").catch((error) => this.log("end worker", error))));
 		}
 		if (this.sweepTimer) clearInterval(this.sweepTimer);
-		for (const live of this.live.values()) live.connection?.close();
-		await new Promise<void>((resolve) => (this.server ? this.server.close(() => resolve()) : resolve()));
+		const closed = new Promise<void>((resolve) => (this.server ? this.server.close(() => resolve()) : resolve()));
+		for (const connection of this.connections) connection.close();
+		await closed;
 		rmSync(this.paths.supervisorSocket, { force: true });
 		rmSync(this.paths.supervisorPid, { force: true });
 		this.log(`supervisor stopped${keepWorkers ? ", workers kept" : ""}`);
@@ -155,6 +158,7 @@ export class Supervisor {
 	// --- Requests -------------------------------------------------------
 
 	private accept(connection: Connection): void {
+		this.connections.add(connection);
 		let workerId: string | undefined;
 		connection.onMessage((message) => {
 			if (message.type === "worker.hello") {
@@ -165,6 +169,7 @@ export class Supervisor {
 			return this.clientRequest(message);
 		});
 		connection.socket.on("close", () => {
+			this.connections.delete(connection);
 			if (workerId) this.workerDisconnected(workerId, connection);
 		});
 	}

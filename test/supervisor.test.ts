@@ -213,3 +213,15 @@ test("a second supervisor on the same agent dir steps aside", async () => {
 		await first.close(false);
 	}
 });
+
+test("close does not wait for clients that stay connected", async () => {
+	const dir = tempDir();
+	const paths = statePaths(dir);
+	const supervisor = await startSupervisor(paths);
+	const client = await connect(paths.supervisorSocket);
+	await client.request({ type: "list" });
+	const started = Date.now();
+	await supervisor.close(false);
+	assert.ok(Date.now() - started < 2_000);
+	await until(() => client.isClosed);
+});

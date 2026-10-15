@@ -464,7 +464,7 @@ The plain pi process then attaches to that worker.
 | Q1 | How does the worker start TypeScript? Node 24 runs `.ts` directly. pi may load extensions with its own loader. | Answered in M0 (§8.1). A plain `.mjs` bootstrap loads `worker.ts` through pi's jiti. |
 | Q2 | May a `tool_call` handler return a promise that pi awaits? | Answered: yes. See §9. |
 | Q3 | Does any pi code write to `process.stdout` outside the `Terminal`? | Answered (§8.4). |
-| Q4 | Do extensions with a global state break when each session gets its own process? This mostly helps them. | Test with the extensions of the user in M2. |
+| Q4 | Do extensions with a global state break when each session gets its own process? This mostly helps them. | Answered in M2: no. A worker with the agent dir of the user loads all extensions. pi-lens, context-mode, and an extension model provider work in it. |
 | Q5 | Should the record keep the full client `env`, or only an allow list? It may hold secrets. | Answered: an allow list with user additions (§6.3). |
 | Q6 | Does a second pi process that opens a session file of a live worker corrupt it? | Answered in M1: no byte damage, but the conversation forks. Each process appends its own entries and never sees the other's. `create` returns the listed session for a known file. M4 routes `--resume` of a live session to attach, as Claude Code does. |
 | Q7 | Can the client run the external editor (`ctrl+g`) for a worker and send the text back? | After M7. |
@@ -533,7 +533,34 @@ Unit tests cover the supervisor with a fake worker, the control channel, the reg
 
 Parts of §7 and §10 that M1 leaves for later milestones:
 
-- The takeover of a held session by a second client (§7.3) works in the worker, but no test covers it yet. M2.
+- The takeover of a held session by a second client (§7.3) works in the worker, but no test covers it yet. M2 adds the test.
 - A version mismatch only prints a warning. The restart of §7.1 comes in M6.
 - Idle reaping, crash restart, and pins come in M6.
 - The old in-process extension (`index.ts`) still loads in every worker if the user installs it. M3 gives it a worker mode.
+
+### M2: done on 2026-10-15
+
+M2 completes attach and detach from the shell (§7.3, §7.4):
+
+- `pi-sm attach` follows `switch` frames to the next session. It tells the user why an attach ended: detach, takeover, or stop.
+- The worker posts a recap on attach (§7.3). It names the last outcome and the time since the last client let go.
+  It says nothing when nothing happened since then.
+- `/sessions detach` detaches the client. The extension reaches the worker through an object on `globalThis`,
+  because pi loads the extension as a separate module instance.
+- The worker drops the SIGHUP handler of pi after `init()`. Before this, a SIGHUP ended the worker.
+- The shutdown patch checks that `shutdown` exists (§8.3). Without it, `/quit` ends the worker.
+- The supervisor ends all client connections on close. Before this, an open client connection kept a shutdown waiting.
+
+`test/e2e.test.ts` runs a real supervisor and real pi workers in a throwaway agent dir, with this package loaded as an extension.
+The agent dir has no login, so no test can reach a model.
+The tests cover survival of a dropped client, redraw with the editor text, the quit keys, takeover, stop, SIGHUP, and `/sessions detach`.
+They skip when no pi is on PATH.
+
+A manual run in a PTY on Linux with pi 1.2.0 showed these results:
+
+- `pi-sm attach` sets raw mode, redraws at the new size after a resize, and restores the shell on `ctrl+d`.
+- A worker with the real agent dir loads all extensions of the user (Q4).
+
+Lesson from the Q4 run: keys typed into a worker with a logged-in model reach the model when a command does not match.
+Tests that type into a worker use an agent dir without a login.
+

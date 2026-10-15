@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import { attach } from "./client.ts";
+import { attach, type AttachResult } from "./client.ts";
 import type { CreateRequest, SessionRecord } from "./control.ts";
 import { loadEnvAllow, pickEnv } from "./env.ts";
 import { agentDirFrom, statePaths, type BootContext, type StatePaths } from "./paths.ts";
@@ -138,24 +138,36 @@ async function attachCommand(context: BootContext, paths: StatePaths, args: stri
 
 async function attachTo(context: BootContext, paths: StatePaths, target: string): Promise<number> {
 	if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("attach needs a terminal.");
-	const handle = await open(context, paths);
-	let found: { id: string; socket: string };
-	try {
-		found = await handle.connection.request({ type: "attach", session: target }, 120_000);
-	} finally {
-		handle.connection.close();
+	// The manager inside a session can send this client to another session.
+	for (let hops = 0; hops < 100; hops++) {
+		const handle = await open(context, paths);
+		let found: { id: string; socket: string };
+		try {
+			found = await handle.connection.request({ type: "attach", session: target }, 120_000);
+		} finally {
+			handle.connection.close();
+		}
+		const result = await attach(found.socket);
+		if (result.kind === "switch") {
+			target = result.id;
+			continue;
+		}
+		process.stderr.write(`${describeEnd(result, found.id)}\n`);
+		return result.kind === "error" ? 1 : 0;
 	}
-	const result = await attach(found.socket);
-	if (result.kind === "error") {
-		process.stderr.write(`pi-sm: ${result.message}\n`);
-		return 1;
+	throw new Error("Too many switches in a row.");
+}
+
+/** What the user reads after an attach ends. */
+export function describeEnd(result: AttachResult, id: string): string {
+	if (result.kind === "error") return `pi-sm: ${result.message}`;
+	if (result.kind === "detached") {
+		const { reason, message } = result.detached;
+		if (reason === "stopped") return `The session ${id} stopped.${message ? ` ${message}` : ""}`;
+		if (reason === "taken") return `Another terminal took over the session. Run "pi-sm attach ${id}" to take it back.`;
+		if (reason === "error") return `The session ${id} sent this terminal away${message ? `: ${message}` : "."}`;
 	}
-	if (result.kind === "detached" && result.detached.reason === "stopped") {
-		process.stderr.write(`The session ${found.id} stopped.${result.detached.message ? ` ${result.detached.message}` : ""}\n`);
-		return 0;
-	}
-	process.stderr.write(`Detached. The session keeps running. Run "pi-sm attach ${found.id}" to come back.\n`);
-	return 0;
+	return `Detached. The session keeps running. Run "pi-sm attach ${id}" to come back.`;
 }
 
 async function stopCommand(context: BootContext, paths: StatePaths, args: string[]): Promise<number> {
