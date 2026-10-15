@@ -1,6 +1,6 @@
 {
 	"name": "@therealbrewerjack/pi-session-manager",
-	"version": "0.3.0",
+	"version": "0.4.0",
 	"description": "Run pi sessions in the background, detach and reattach them from any terminal, and manage them from a Claude-Code-style overlay. Builds on pi-parallel-sessions (session runtime, path locks, pickers).",
 	"type": "module",
 	"license": "MIT",
