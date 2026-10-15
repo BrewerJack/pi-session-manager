@@ -1,7 +1,7 @@
 {
 	"name": "@therealbrewerjack/pi-session-manager",
 	"version": "0.3.0",
-	"description": "Run several agent sessions in one pi process and manage them from a Claude-Code-style overlay",
+	"description": "Run pi sessions in the background, detach and reattach them from any terminal, and manage them from a Claude-Code-style overlay. Builds on pi-parallel-sessions (session runtime, path locks, pickers).",
 	"type": "module",
 	"license": "MIT",
 	"author": "John Hautzinger <john@hautzinger.org>",
@@ -27,6 +27,11 @@
 		"log.ts",
 		"ui.ts",
 		"pickers.ts",
+		"protocol.ts",
+		"socket-terminal.ts",
+		"client.ts",
+		"worker.ts",
+		"worker-boot.mjs",
 		"README.md",
 		"LICENSE"
 	],

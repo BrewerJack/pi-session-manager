@@ -230,17 +230,27 @@ This extension builds on [pi-parallel-sessions](https://github.com/liushihao456/
 by [liushihao456](https://github.com/liushihao456), under the MIT license.
 That project showed how to run several pi sessions in one process and pass the terminal between them.
 
-These parts come from pi-parallel-sessions:
+As of 0.4.0, pi-session-manager no longer uses the **terminal handoff** of pi-parallel-sessions.
+That code parked the main session and gave the screen to a child.
+Each session now runs in its own process, and a terminal attaches to it over a socket.
+There is no main session anymore.
 
-- **Session runtime** (`host.ts`): the code that creates each child session with the model,
-  thinking level, tools, and project trust of its parent.
-- **Terminal handoff** (`host.ts`): the code that parks the main session and gives the screen to a child.
+These parts still come from pi-parallel-sessions:
+
+- **Session runtime** (`runtime.ts`): the code that creates each session with the model,
+  thinking level, tools, and project trust of the session that started it.
 - **Path locks** (`locks.ts`): the code that stops two sessions from writing the same path at once.
+  The supervisor now runs it for all session processes.
 - **Pickers** (`pickers.ts`): the folder explorer and the saved-session picker.
 
+Versions 0.1.0 to 0.3.0 also used the terminal handoff, in `host.ts`.
+
 This project adds the manager overlay, the detail screen, the status bar, and background agents.
-It also adds the hidden terminal for background sessions, usage and context stats, notices,
-and the `/sessions` subcommands, macOS keyboard support, and case-aware and symlink-aware path locks.
+It also adds usage and context stats, notices, the `/sessions` subcommands, macOS keyboard support,
+and case-aware and symlink-aware path locks.
+As of 0.4.0, it also adds the supervisor, the session processes, the socket terminal,
+and detach and attach from any terminal.
+It drops the hidden terminal that versions 0.1.0 to 0.3.0 used for background sessions.
 
 ## License
 
