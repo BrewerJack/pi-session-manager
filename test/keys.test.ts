@@ -98,13 +98,30 @@ test("macOS shows modifier symbols, other platforms keep the key id", () => {
 	assert.equal(displayKey("alt+s", "win32"), "alt+s");
 });
 
+test("pi-tui reads the translated key as alt+s with and without the Kitty protocol", async () => {
+	const { loadKeyConfig: load, macOptionTranslator } = await import("../keys.ts");
+	const { matchesKey, setKittyProtocolActive } = await import("@earendil-works/pi-tui");
+	const sent = macOptionTranslator(load("/nonexistent/settings.json", {}), (name) => name === "option")!("ß");
+	assert.equal(sent, "\x1b[115;3u");
+	try {
+		for (const kitty of [false, true]) {
+			setKittyProtocolActive(kitty);
+			assert.equal(matchesKey(sent, "alt+s"), true, `kitty ${kitty}`);
+		}
+		// The legacy form fails in a worker with the Kitty protocol. This was the bug of 0.4.1.
+		assert.equal(matchesKey("\x1bs", "alt+s"), false);
+	} finally {
+		setKittyProtocolActive(false);
+	}
+});
+
 test("a client turns the macOS Option character into the alt shortcut while Option is held", async () => {
 	const { loadKeyConfig: load, macOptionTranslator, macModifierProbe } = await import("../keys.ts");
 	const config = load("/nonexistent/settings.json", {});
 	let option = true;
 	const translate = macOptionTranslator(config, (name) => name === "option" && option);
 	assert.ok(translate);
-	assert.equal(translate!("ß"), "\x1bs");
+	assert.equal(translate!("ß"), "\x1b[115;3u");
 	assert.equal(translate!("ßß"), "ßß");
 	assert.equal(translate!("a"), "a");
 	option = false;

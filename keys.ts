@@ -131,13 +131,16 @@ export function macModifierProbe(getHelper: () => unknown, platform = process.pl
 
 /**
  * A worker has no keyboard, so the client handles the macOS key (spec §11). The client turns
- * the Option character into the escape sequence of the alt+letter shortcut. Undefined when
- * nothing needs a translation.
+ * the Option character into the alt+letter shortcut. Undefined when nothing needs a translation.
+ *
+ * The client sends the Kitty form, CSI <codepoint>;3u. A worker that uses the Kitty keyboard
+ * protocol, as pi does in Ghostty, kitty, WezTerm, and iTerm2, ignores the legacy form ESC <letter>.
+ * pi-tui reads the Kitty form in both modes.
  */
 export function macOptionTranslator(config: KeyConfig, pressed: ModifierProbe | undefined): ((data: string) => string) | undefined {
 	const letter = /^alt\+([a-z])$/.exec(config.shortcut)?.[1];
 	if (!pressed || !letter || !config.macOptionChars.length) return undefined;
-	const sequence = `\x1b${letter}`;
+	const sequence = `\x1b[${letter.charCodeAt(0)};3u`;
 	return (data) => (isMacOptionShortcut(data, config.macOptionChars, pressed) ? sequence : data);
 }
 
