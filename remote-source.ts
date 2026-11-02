@@ -9,7 +9,8 @@ import type { BootContext, StatePaths } from "./paths.ts";
 import { connectSupervisor } from "./supervisor-client.ts";
 import type { TranscriptItem } from "./transcript.ts";
 
-export type Row = PublicRecord;
+/** `plain` marks the session of plain pi itself, which the supervisor does not run. */
+export type Row = PublicRecord & { plain?: boolean };
 export type Activity = "idle" | "working" | "waiting";
 
 export interface CreateOptions extends Inheritance {

@@ -59,7 +59,40 @@ test("enter on the current session only closes the manager", () => {
 
 test("an empty list says how to start a session", () => {
 	const { manager } = view([]);
-	assert.match(manager.render(80).join("\n"), /No sessions\. Press n to start one\./);
+	assert.match(manager.render(100).join("\n"), /No background sessions\. Press n for a new one, or r to open a saved pi session\./);
+	manager.dispose();
+});
+
+test("plain pi alone shows its own row and the hint", () => {
+	const { manager, result } = view([row("plain-1", { name: "here", plain: true })], "plain-1");
+	const text = manager.render(100).join("\n");
+	assert.match(text, /here \(this session\)/);
+	assert.match(text, /No background sessions\. Press n for a new one/);
+	manager.handleInput("\r");
+	assert.equal(result(), undefined);
+	manager.dispose();
+});
+
+test("the hint goes away when a background session exists", () => {
+	const { manager } = view([row("plain-1", { name: "here", plain: true }), row("s2", { name: "bg" })], "plain-1");
+	const text = manager.render(100).join("\n");
+	assert.match(text, /here \(this session\)/);
+	assert.match(text, /bg/);
+	assert.doesNotMatch(text, /No background sessions/);
+	manager.dispose();
+});
+
+test("k and p on the plain row explain instead of stopping or pinning", () => {
+	const rows = [row("plain-1", { name: "here", plain: true })];
+	const calls: string[] = [];
+	const src = { ...source(rows, "plain-1"), stop: async (id: string) => void calls.push(`stop ${id}`), pin: async (id: string) => void calls.push(`pin ${id}`) };
+	const manager = new ManagerView({ tui, theme, source: src, cwd: "/tmp", done: () => {} });
+	manager.handleInput("k");
+	assert.match(manager.render(100).join("\n"), /Use \/quit to end it/);
+	assert.doesNotMatch(manager.render(100).join("\n"), /Stop "here"\?/);
+	manager.handleInput("p");
+	assert.match(manager.render(100).join("\n"), /Only background sessions take a pin/);
+	assert.deepEqual(calls, []);
 	manager.dispose();
 });
 

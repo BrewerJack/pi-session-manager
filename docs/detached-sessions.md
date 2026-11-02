@@ -693,3 +693,23 @@ M7 finishes 0.4.0:
 
 A start of plain pi with the real agent dir and all extensions of the user showed no extension error.
 
+
+### 0.4.1: the row of plain pi
+
+User reports after 0.4.0 showed two gaps in plain pi:
+
+- `pi --session <file>` opened the manager, but the session of plain pi did not show in it.
+- A new install showed an empty list with no hint about what to do next.
+
+0.4.1 changes the client mode of §11 so that plain pi lists its own session again, like the main session of 0.3:
+
+- `plain-source.ts` wraps the `RemoteSource`. It puts a row for the session of plain pi at the top and sets
+  `currentId` to it, so the row shows `(this session)`. The supervisor does not know this row.
+- The row reads the pi context: state, model, usage, the last exchange, and the name. pi events
+  (`agent_start`, `agent_end`, `turn_end`, `message_end`, `model_select`, `thinking_level_select`) rebuild it.
+- `⏎` on the row closes the manager. `m`, `e`, and `x` act on plain pi. `k` and `p` show a notice instead,
+  because only `/quit` ends plain pi, and pins apply only to workers.
+- The client loop of `startDetached` and of a routed resume keeps the plain session hidden, as §5.2 says.
+- Without background sessions, the manager says: "No background sessions. Press n for a new one, or r to open a saved pi session."
+
+Tests: `test/plain-source.test.ts`, new cases in `test/ui.test.ts`, and a PTY case in `test/plain-pi.test.ts`.

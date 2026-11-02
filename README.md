@@ -127,6 +127,9 @@ Each row shows one session:
 | `•` | The agent finished while no terminal showed it. |
 
 `(this session)` marks the session that runs the manager.
+In plain `pi`, the session of plain pi is always the first row, even when it does not run in the background.
+`⏎`, `m`, `e`, and `x` work on it. `k` and `p` do not, because `/quit` ends plain pi and pins apply only to background sessions.
+`/sessions bg` moves it to the background.
 `(open elsewhere)` marks a session that another terminal shows.
 `pinned` marks a session that keeps its process when it idles.
 

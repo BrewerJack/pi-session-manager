@@ -23,6 +23,7 @@ import {
 	setInputValueAtEnd,
 	type SavedSessionInfo,
 } from "./pickers.ts";
+import { PLAIN_PIN_TEXT, PLAIN_STOP_TEXT } from "./plain-source.ts";
 import { activityOf, titleOf, type Row, type SessionSource } from "./remote-source.ts";
 import { emptyUsage, type TranscriptItem } from "./transcript.ts";
 
@@ -34,6 +35,8 @@ export type ManagerResult = { type: "open"; id: string } | undefined;
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TICK_MS = 100;
 const PREVIEW_ROWS = 5;
+/** What the manager says when no background session exists. */
+export const EMPTY_HINT = "No background sessions. Press n for a new one, or r to open a saved pi session.";
 
 // ---------------------------------------------------------------------------
 // Formatting helpers
@@ -450,6 +453,10 @@ export class ManagerView implements Component, Focusable {
 	/** A pinned session keeps its worker when it idles (spec §7.6). */
 	private togglePin(r: Row | undefined): void {
 		if (!r) return;
+		if (r.plain) {
+			this.say(PLAIN_PIN_TEXT, "warning");
+			return;
+		}
 		void this.run("Pin", async () => {
 			await this.source.pin(r.id, !r.pinned);
 			this.say(r.pinned ? `"${titleOf(r)}" can stop when idle` : `"${titleOf(r)}" keeps running when idle`);
@@ -458,6 +465,10 @@ export class ManagerView implements Component, Focusable {
 
 	private requestKill(r: Row | undefined): void {
 		if (!r) return;
+		if (r.plain) {
+			this.say(PLAIN_STOP_TEXT, "warning");
+			return;
+		}
 		this.confirmKillId = r.id;
 		this.requestRender();
 	}
@@ -761,13 +772,18 @@ export class ManagerView implements Component, Focusable {
 		const visible = list.slice(start, start + slots);
 
 		if (!list.length) {
-			let empty = query ? "No sessions match." : "No sessions. Press n to start one.";
+			let empty = query ? "No sessions match." : EMPTY_HINT;
 			if (!query && this.source.problem) empty = this.source.problem;
 			out.push(box.line(th.fg("dim", empty)));
 			out.push(box.line());
 		}
 		if (start > 0) out.push(box.line(th.fg("dim", `  ↑ ${start} more`)));
 		visible.forEach((r, i) => out.push(...this.renderRow(r, start + i, inner).map((l) => box.line(l))));
+		// Plain pi always lists its own row. Without background sessions, say how to get one.
+		if (!query && list.length && list.every((r) => r.plain)) {
+			out.push(box.line());
+			out.push(box.line(th.fg("dim", this.source.problem ?? EMPTY_HINT)));
+		}
 		const below = list.length - start - visible.length;
 		if (below > 0) out.push(box.line(th.fg("dim", `  ↓ ${below} more`)));
 

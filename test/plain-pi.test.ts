@@ -164,6 +164,28 @@ test("a main session of 0.3.0 hands its child list to the session list once", { 
 	}
 });
 
+test("the manager of plain pi lists its own session, and k does not stop it", { skip }, async () => {
+	const fixture = readFileSync(path.join(ROOT, "test", "fixtures", "conversation.jsonl"), "utf8");
+	const own = path.join(workDir, "own.jsonl");
+	writeFileSync(own, fixture.replace('"cwd":"/tmp"', `"cwd":${JSON.stringify(workDir)}`));
+	const pi = runPi(["--session", own]);
+	try {
+		await pi.wait("7 files");
+		await pi.type("\x1bs");
+		await pi.wait("(this session)");
+		// The manager starts on another session. The plain row is the first row.
+		await pi.type("\x1b[A");
+		await pi.type("k");
+		await pi.wait("Use /quit to end it");
+		await pi.type("q");
+		await pi.type("\x04");
+		assert.equal(await pi.exit, 0);
+		assert.equal((await sessions()).some((r) => r.sessionFile === own), false, "the plain session stays out of the supervisor");
+	} finally {
+		pi.kill();
+	}
+});
+
 test("startDetached opens the manager at once and ends pi with it", { skip }, async () => {
 	writeSettings({ sessionManager: { startDetached: true } });
 	const pi = runPi([]);

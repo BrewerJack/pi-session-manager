@@ -5,6 +5,7 @@
 // The extension runs in two modes (spec §11). In a worker, it belongs to a background
 // session, and the manager switches the client of the worker to another session. In plain
 // pi, it is a client: opening a session parks the TUI of pi and attaches the terminal.
+// In plain pi, the list also shows the session of plain pi itself as its top row.
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,6 +33,7 @@ import { debug } from "./log.ts";
 import { statePaths, type BootContext } from "./paths.ts";
 import { Registry } from "./registry.ts";
 import { activityOf, RemoteSource, titleOf, type Row, type SessionSource } from "./remote-source.ts";
+import { PLAIN_STOP_TEXT, PlainSource, type PlainSession } from "./plain-source.ts";
 import { readManagerSettings } from "./settings.ts";
 import { totalTokens } from "./transcript.ts";
 import {
@@ -54,6 +56,7 @@ let SHORTCUT = displayKey(KEYS.shortcut, process.platform);
 const WIDGET_KEY = "pi-session-manager";
 const FOOTER_KEY = "pi-session-manager";
 const SOURCE_KEY = Symbol.for("pi-session-manager.source");
+const PLAIN_KEY = Symbol.for("pi-session-manager.plain");
 /** The custom entry in which versions 0.1.0 to 0.3.0 listed the child sessions of a main session. */
 const CHILDREN_ENTRY = "pi-session-manager.children";
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -99,10 +102,45 @@ function getSource(): RemoteSource {
 	return source;
 }
 
+/** The list of plain pi, with its own session as the top row. One per process, like the source. */
+function getPlainSource(source: RemoteSource): PlainSource {
+	const g = globalThis as Record<symbol, PlainSource | undefined>;
+	g[PLAIN_KEY] ??= new PlainSource(source, getPackageDir());
+	return g[PLAIN_KEY];
+}
+
+/** The plain row reads the newest context, because pi gives a new one to each event. */
+function plainSession(pi: ExtensionAPI, holder: { ctx: ExtensionContext }): PlainSession {
+	const ctx = () => holder.ctx;
+	return {
+		cwd: () => ctx().cwd || process.cwd(),
+		entries: () => ctx().sessionManager.getEntries(),
+		branch: () => ctx().sessionManager.getBranch(),
+		sessionFile: () => ctx().sessionManager.getSessionFile(),
+		sessionId: () => ctx().sessionManager.getSessionId(),
+		name: () => ctx().sessionManager.getSessionName(),
+		modelLabel: () => {
+			const id = ctx().model?.id;
+			if (!id) return undefined;
+			const thinking = ctx().thinkingLevel;
+			return thinking && thinking !== "off" ? `${id} · ${thinking}` : id;
+		},
+		contextPercent: () => ctx().getContextUsage()?.percent ?? null,
+		busy: () => !ctx().isIdle(),
+		send: (text, busy) => pi.sendUserMessage(text, busy ? { deliverAs: "followUp" } : undefined),
+		rename: (name) => pi.setSessionName(name),
+		interrupt: () => ctx().abort(),
+	};
+}
+
 /** State of one extension instance. */
 interface Instance {
 	pi: ExtensionAPI;
 	source: RemoteSource;
+	/** Only in plain pi: the list with the row of plain pi. */
+	plain?: PlainSource;
+	/** What the manager, the status bar, the footer, and the notices read. */
+	view: SessionSource;
 	/** Stop functions for the parts that session_shutdown removes. */
 	cleanup: (() => void)[];
 	managerOpen: boolean;
@@ -114,11 +152,14 @@ interface Instance {
 export default function sessionManager(pi: ExtensionAPI) {
 	KEYS = loadKeyConfig(path.join(getAgentDir(), "settings.json"), process.env);
 	SHORTCUT = displayKey(KEYS.shortcut, process.platform);
-	const self: Instance = { pi, source: getSource(), cleanup: [], managerOpen: false, warnedKeys: false, clientLoop: false };
+	const source = getSource();
+	const plain = process.env.PI_SESSION_MANAGER_WORKER ? undefined : getPlainSource(source);
+	const self: Instance = { pi, source, plain, view: plain ?? source, cleanup: [], managerOpen: false, warnedKeys: false, clientLoop: false };
+	let holder: { ctx: ExtensionContext } | undefined;
 
 	pi.registerCommand("sessions", {
 		description: "Manage background sessions (new, list, open, rename, stop, resume, detach)",
-		getArgumentCompletions: (prefix: string) => completeArgs(self.source, prefix),
+		getArgumentCompletions: (prefix: string) => completeArgs(self.view, prefix),
 		handler: async (args: string, ctx: ExtensionCommandContext) => runCommand(self, args.trim(), ctx),
 	});
 
@@ -130,10 +171,32 @@ export default function sessionManager(pi: ExtensionAPI) {
 
 	pi.on("session_start", (event, ctx) => {
 		if (ctx.mode !== "tui") return;
+		if (workerBridge()) {
+			installSessionUi(self, ctx);
+			return;
+		}
+		const routed = routeAtStart(self, event.reason, ctx);
+		// A routed start runs the client loop. Its own session stays hidden (spec §5.2).
+		holder = routed ? undefined : { ctx };
+		self.plain?.bind(holder ? plainSession(pi, holder) : undefined);
 		installSessionUi(self, ctx);
-		if (workerBridge()) return;
-		if (!routeAtStart(self, event.reason, ctx) && event.reason !== "reload") importOldChildren(self, ctx);
+		if (!routed && event.reason !== "reload") importOldChildren(self, ctx);
 	});
+
+	// Keep the row of plain pi up to date: its state, model, usage, and name.
+	if (plain) {
+		const refresh = (_event: unknown, ctx: ExtensionContext) => {
+			if (!holder) return;
+			holder.ctx = ctx;
+			plain.changed();
+		};
+		pi.on("agent_start", refresh);
+		pi.on("agent_end", refresh);
+		pi.on("turn_end", refresh);
+		pi.on("message_end", refresh);
+		pi.on("model_select", refresh);
+		pi.on("thinking_level_select", refresh);
+	}
 
 	// A worker takes its locks in its own inline extension. Plain pi takes them here (spec §9).
 	if (!process.env.PI_SESSION_MANAGER_WORKER) {
@@ -151,6 +214,8 @@ export default function sessionManager(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_shutdown", () => {
+		holder = undefined;
+		self.plain?.bind(undefined);
 		for (const stop of self.cleanup.splice(0)) {
 			try {
 				stop();
@@ -164,9 +229,9 @@ export default function sessionManager(pi: ExtensionAPI) {
 /** The status bar, the footer breakdown, the notices about other sessions, and the macOS shortcut. */
 function installSessionUi(self: Instance, ctx: ExtensionContext): void {
 	for (const stop of self.cleanup.splice(0)) stop();
-	self.cleanup.push(installStatusBar(self.source, ctx));
-	self.cleanup.push(installFooterBreakdown(self.source, ctx));
-	self.cleanup.push(watchOthers(self.source, ctx));
+	self.cleanup.push(installStatusBar(self.view, ctx));
+	self.cleanup.push(installFooterBreakdown(self.view, ctx));
+	self.cleanup.push(watchOthers(self.view, ctx));
 	// A worker has no keyboard. Its client handles the macOS key.
 	if (!workerBridge()) {
 		const stop = installMacOptionKey(self, ctx);
@@ -291,7 +356,7 @@ function inheritFrom(ctx: Ctx): Inheritance {
 
 async function openManager(self: Instance, ctx: Ctx, initial?: "resume" | "new"): Promise<void> {
 	if (ctx.mode !== "tui") {
-		ctx.ui.notify(statusReport(self.source), "info");
+		ctx.ui.notify(statusReport(self.view), "info");
 		return;
 	}
 	const result = await showManager(self, ctx, { initial });
@@ -304,7 +369,8 @@ async function showManager(
 	ctx: Ctx,
 	options: { initial?: "resume" | "new"; notice?: Notice; full?: boolean } = {},
 ): Promise<ManagerResult> {
-	const { source } = self;
+	// The client loop hides the session of plain pi. pi ends when the manager closes.
+	const source = options.full ? self.source : self.view;
 	if (self.managerOpen) return undefined;
 	self.managerOpen = true;
 	// The user asks for sessions now. Start the supervisor if none runs.
@@ -568,14 +634,18 @@ async function newCommand(self: Instance, ctx: ExtensionCommandContext, value: s
 
 async function listCommand(self: Instance, ctx: ExtensionCommandContext): Promise<void> {
 	await self.source.ensureConnected().catch((error) => debug(error));
-	ctx.ui.notify(statusReport(self.source), "info");
+	ctx.ui.notify(statusReport(self.view), "info");
 }
 
 async function openCommand(self: Instance, ctx: ExtensionCommandContext, value: string): Promise<void> {
 	await self.source.ensureConnected();
-	const target = value ? self.source.get(value) : undefined;
+	const target = value ? self.view.get(value) : undefined;
 	if (!target) {
 		ctx.ui.notify(value ? `No session matches "${value}".` : "Usage: /sessions open <name>", "warning");
+		return;
+	}
+	if (target.plain) {
+		ctx.ui.notify("This session already shows in this terminal.", "info");
 		return;
 	}
 	await openSession(self.source, ctx, target.id);
@@ -592,9 +662,13 @@ async function renameCommand(self: Instance, ctx: ExtensionCommandContext, value
 
 async function stopCommand(self: Instance, ctx: ExtensionCommandContext, value: string): Promise<void> {
 	await self.source.ensureConnected();
-	const target = value ? self.source.get(value) : undefined;
+	const target = value ? self.view.get(value) : undefined;
 	if (!target) {
 		ctx.ui.notify(value ? `No session matches "${value}".` : "Usage: /sessions stop <name>", "warning");
+		return;
+	}
+	if (target.plain) {
+		ctx.ui.notify(PLAIN_STOP_TEXT, "warning");
 		return;
 	}
 	const title = titleOf(target);

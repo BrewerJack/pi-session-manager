@@ -41,6 +41,7 @@
 		"boot.mjs",
 		"bin/pi-sm.mjs",
 		"remote-source.ts",
+		"plain-source.ts",
 		"runtime.ts",
 		"session-file.ts",
 		"transcript.ts",
