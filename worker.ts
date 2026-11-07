@@ -40,6 +40,8 @@ type Sdk = typeof import("@earendil-works/pi-coding-agent");
 /** A worker without a supervisor for this long ends itself (spec §7.6). */
 const ORPHAN_AFTER_MS = 60_000;
 const RECONNECT_MS = 2_000;
+/** If the shutdown of an orphan does not finish in this time, the orphan exits by force. */
+const ORPHAN_EXIT_GRACE_MS = 15_000;
 /** Streaming text goes to the supervisor at most this often (spec §8.5). */
 const REPLY_THROTTLE_MS = 250;
 /** A write waits this long for the supervisor to grant its locks. Then it goes ahead (spec §9). */
@@ -114,7 +116,7 @@ export async function runWorker(sdk: Sdk, tui: TuiDeps, options: WorkerOptions):
 	const session = () => runtime?.session;
 	const link = new SupervisorLink(options, log, {
 		stop: () => attachments?.stop("stopped"),
-		orphan: () => attachments?.stop("stopped", "The supervisor is gone.") ?? process.exit(0),
+		orphan: () => endOrphan(attachments, log),
 		request: (message) => answer(session(), run, message),
 	});
 	run.isAttached = () => attachments?.attached ?? false;
@@ -460,6 +462,29 @@ function publishBridge(id: string, attachments: Attachments, run: RunState): voi
 		},
 	};
 	(globalThis as Record<symbol, unknown>)[WORKER_BRIDGE_KEY] = bridge;
+}
+
+/**
+ * End a worker that has no supervisor. pi's shutdown exits the process when it finishes.
+ * Without a session yet, exit now. If the shutdown hangs, exit after a grace period.
+ */
+export function endOrphan(
+	attachments: Pick<Attachments, "stop"> | undefined,
+	log: Log,
+	exit: (code: number) => void = (code) => process.exit(code),
+	graceMs = ORPHAN_EXIT_GRACE_MS,
+): ReturnType<typeof setTimeout> | undefined {
+	if (!attachments) {
+		exit(0);
+		return undefined;
+	}
+	attachments.stop("stopped", "The supervisor is gone.");
+	const timer = setTimeout(() => {
+		log(`the shutdown did not finish in ${graceMs} ms. Exiting.`);
+		exit(0);
+	}, graceMs);
+	timer.unref();
+	return timer;
 }
 
 // ---------------------------------------------------------------------------
