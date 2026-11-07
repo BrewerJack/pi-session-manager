@@ -466,7 +466,8 @@ function publishBridge(id: string, attachments: Attachments, run: RunState): voi
 
 /**
  * End a worker that has no supervisor. pi's shutdown exits the process when it finishes.
- * Without a session yet, exit now. If the shutdown hangs, exit after a grace period.
+ * If the shutdown hangs, exit after a grace period. If the shutdown fails to start, exit now.
+ * Without attachments, exit now. link.start() comes after attachments exist, so this is only a fallback.
  */
 export function endOrphan(
 	attachments: Pick<Attachments, "stop"> | undefined,
@@ -478,12 +479,19 @@ export function endOrphan(
 		exit(0);
 		return undefined;
 	}
-	attachments.stop("stopped", "The supervisor is gone.");
+	// Start the timer first. Then the worker exits even if stop() throws.
 	const timer = setTimeout(() => {
 		log(`the shutdown did not finish in ${graceMs} ms. Exiting.`);
 		exit(0);
 	}, graceMs);
-	timer.unref();
+	timer.unref?.();
+	try {
+		attachments.stop("stopped", "The supervisor is gone.");
+	} catch (error) {
+		log("the shutdown failed to start. Exiting.", error);
+		clearTimeout(timer);
+		exit(0);
+	}
 	return timer;
 }
 
